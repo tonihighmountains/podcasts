@@ -58,6 +58,8 @@ const ICONS = {
   close: '<path d="M6 6l12 12M18 6L6 18"/>',
   shows: '<rect x="4" y="4" width="6.5" height="6.5" rx="2"/><rect x="13.5" y="4" width="6.5" height="6.5" rx="2"/><rect x="4" y="13.5" width="6.5" height="6.5" rx="2"/><rect x="13.5" y="13.5" width="6.5" height="6.5" rx="2"/>',
   lists: '<path d="M4 6h11M4 12h11M4 18h6"/><path d="M17.5 14v6l4.5-3z" fill="currentColor"/>',
+  prev: '<path d="M6 5v14"/><path d="M19 5.5v13L9.5 12z" fill="currentColor" stroke="none"/>',
+  next: '<path d="M18 5v14"/><path d="M5 5.5v13L14.5 12z" fill="currentColor" stroke="none"/>',
   grip: '<path d="M5 8h14M5 12h14M5 16h14"/>',
   circle: '<circle cx="12" cy="12" r="9"/>',
   checkfill: '<circle cx="12" cy="12" r="10" fill="currentColor" stroke="none"/><path d="M7.5 12.5l3 3 6-7" stroke="var(--on-accent)"/>',
@@ -91,7 +93,7 @@ const saveCfg = () => jset(LS.cfg, cfg);
 const cfgOK = () => !!(cfg.worker && cfg.key);
 const findEp = (id) => epMap.get(id) || state.episodes[id] || null;
 const visibleShows = () => Object.values(state.shows).filter((s) => !s.del).sort((a, b) => (a.added || 0) - (b.added || 0));
-const visibleLists = () => Object.values(state.playlists).filter((l) => !l.del).sort((a, b) => (a.added || 0) - (b.added || 0));
+const visibleLists = () => Object.values(state.playlists).filter((l) => !l.del).sort((a, b) => (a.order ?? a.added ?? 0) - (b.order ?? b.added ?? 0));
 
 /* IndexedDB (audios descargados) */
 let dbp;
@@ -235,6 +237,15 @@ function parseDuration(s) {
   if (p.some(isNaN)) return 0;
   return p.reduce((a, v) => a * 60 + v, 0);
 }
+function plainText(h, max = 800) {
+  if (!h) return '';
+  let t = h.replace(/<\s*(br|\/p|\/div|\/li|\/h\d)[^>]*>/gi, '\n').replace(/<[^>]+>/g, '');
+  t = t.replace(/&nbsp;/g, ' ').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'")
+    .replace(/&#(\d+);/g, (m, n) => String.fromCharCode(+n)).replace(/&#x([0-9a-f]+);/gi, (m, n) => String.fromCharCode(parseInt(n, 16)))
+    .replace(/&amp;/g, '&');
+  t = t.replace(/[ \t]+/g, ' ').replace(/ ?\n ?/g, '\n').replace(/\n{2,}/g, '\n').trim();
+  return t.length > max ? t.slice(0, max).replace(/\s+\S*$/, '') + '…' : t;
+}
 function parseFeed(xml, feedUrl) {
   const doc = new DOMParser().parseFromString(xml, 'text/xml');
   const ch = doc.getElementsByTagName('channel')[0];
@@ -253,6 +264,7 @@ function parseFeed(xml, feedUrl) {
       audio,
       pub: Date.parse(childText(it, 'pubDate')) || 0,
       dur: parseDuration(childText(it, 'itunes:duration')),
+      desc: plainText(childText(it, 'description') || childText(it, 'itunes:summary') || childText(it, 'content:encoded')),
       image: ((u) => (u && u !== image ? u : ''))(child(it, 'itunes:image')?.getAttribute('href')),
     });
   }
@@ -271,8 +283,14 @@ async function refreshShow(id, force = false) {
   loading[id] = true;
   try {
     const p = await fetchFeed(s.feed);
-    feeds[id] = { at: now(), episodes: p.episodes };
-    p.episodes.forEach((e) => epMap.set(e.id, e));
+    // Se acumulan los episodios: los que la emisora retira del RSS se conservan (marcados como retirados)
+    const fresh = new Set(p.episodes.map((e) => e.id));
+    const byId = new Map((feeds[id]?.episodes || []).map((e) => [e.id, e]));
+    byId.forEach((e) => { if (!fresh.has(e.id)) e.gone = true; });
+    p.episodes.forEach((e) => { const prev = byId.get(e.id); byId.set(e.id, prev ? { ...prev, ...e, gone: false } : e); });
+    const merged = Array.from(byId.values()).sort((a, b) => b.pub - a.pub).slice(0, 3000);
+    feeds[id] = { at: now(), episodes: merged };
+    merged.forEach((e) => epMap.set(e.id, e));
     feedPut(id, feeds[id]).catch((e) => console.warn('No se pudo guardar el RSS', e));
     if (!s.image && p.image) { s.image = p.image; s.mod = now(); touch(); }
   } catch (e) {
@@ -332,7 +350,7 @@ function addManyToList(listId, ids) {
     const ep = findEp(id);
     if (!ep) return;
     if (l.items.includes(id)) { dup++; return; }
-    state.episodes[id] = { ...ep, mod: now() };
+    state.episodes[id] = { ...ep, desc: (ep.desc || '').slice(0, 400), gone: undefined, mod: now() };
     l.items.push(id); added++;
   });
   if (added) { l.mod = now(); touch(); }
@@ -346,6 +364,33 @@ function filterEps(eps, q) {
   const words = normTxt(q).split(/\s+/).filter(Boolean);
   if (!words.length) return eps;
   return eps.filter((e) => { const t = normTxt(e.title); return words.every((w) => t.includes(w)); });
+}
+function moveList(from, to) {
+  const arr = visibleLists();
+  if (from === to || from < 0 || to < 0 || from >= arr.length || to >= arr.length) return;
+  const [x] = arr.splice(from, 1);
+  arr.splice(to, 0, x);
+  arr.forEach((l, i) => { if (l.order !== i) { l.order = i; l.mod = now(); } });
+  touch();
+}
+function removeEverywhere(id) {
+  visibleLists().forEach((l) => { if (l.items.includes(id)) { l.items = l.items.filter((x) => x !== id); l.mod = now(); } });
+  touch();
+}
+function removeItemFromList(listId, epId) {
+  const l = state.playlists[listId];
+  if (!l || !l.items.includes(epId)) return;
+  l.items = l.items.filter((x) => x !== epId);
+  l.mod = now(); touch();
+  if (downloaded.has(epId) && !inOtherLists(epId, listId)) deleteDl(epId);
+  toast('Quitado: ' + short(findEp(epId)?.title, 34));
+  render();
+}
+async function askDeleteList(id) {
+  const l = state.playlists[id];
+  if (!l) return;
+  if (!(await confirmBox('Eliminar lista', `Se eliminará "${l.name}". Las descargas no se borran.`, 'Eliminar', true))) return;
+  closeSheet(); l.del = true; l.mod = now(); touch(); render();
 }
 function moveItemTo(listId, from, to) {
   const l = state.playlists[listId];
@@ -522,13 +567,13 @@ function onTime() {
   }
 }
 function updateScrubUI(t, d) {
-  const r = $('#p-range'), c = $('#p-cur'), l = $('#p-left');
+  const r = $('#p-range'), c = $('#p-cur'), l = $('#p-total');
   if (!r) return;
   const pct = d ? (t / d) * 100 : 0;
   r.value = d ? Math.round((t / d) * 1000) : 0;
   r.style.setProperty('--pct', pct + '%');
   c.textContent = fmtTime(t);
-  l.textContent = d ? '-' + fmtTime(d - t) : '';
+  l.textContent = d ? '/ ' + fmtTime(d) : '';
 }
 function onEnded() {
   if (!cur) return;
@@ -592,6 +637,18 @@ function setMedia(ep) {
   h('seekto', (d) => { if (d.seekTime != null) A.currentTime = d.seekTime; });
 })();
 
+function prevEp() {
+  if (!cur) return;
+  if (A.currentTime > 5 || qi <= 0) { A.currentTime = 0; return; }
+  qi--;
+  const e = findEp(queue[qi]);
+  if (e) loadEp(e, true);
+}
+function nextEp() {
+  if (!cur) return;
+  if (qi + 1 < queue.length) { qi++; const e = findEp(queue[qi]); if (e) loadEp(e, true); }
+  else toast('Es el último episodio de la lista');
+}
 function cycleRate() {
   const i = RATES.indexOf(cfg.rate);
   cfg.rate = RATES[(i + 1) % RATES.length];
@@ -637,21 +694,34 @@ function epRow(ep, o = {}) {
   const pct = p && p.d ? Math.min(100, Math.round((p.t / p.d) * 100)) : 0;
   const on = cur && cur.id === ep.id;
   const s = state.shows[ep.showId];
-  const meta = [s && o.list ? s.title : '', [fmtDate(ep.pub), fmtDur(ep.dur)].filter(Boolean).join(', ')].filter(Boolean).join(' - ');
-  const stateTxt = p && p.done ? 'Escuchado' : pct > 0 ? 'Va por ' + fmtTime(p.t) : '';
-  let side, lead = '';
+  const first = (o.list || o.dl) && s ? s.title : '';
+  const second = o.dl ? fmtBytes(dlMeta[ep.id]?.size || 0) : [fmtDate(ep.pub), fmtDur(ep.dur)].filter(Boolean).join(', ');
+  const meta = [first, second].filter(Boolean).join(' - ');
+  let stateTxt = p && p.done ? 'Escuchado' : pct > 0 ? 'Va por ' + fmtTime(p.t) : '';
+  if (!stateTxt && ep.gone && !downloaded.has(ep.id) && !o.list && !o.dl) stateTxt = 'Retirado del RSS';
   const isSel = !!(o.sel && sel.has(ep.id));
+  let lead = '', side = '';
   if (o.list) {
-    lead = o.sel
-      ? `<button class="chk${isSel ? ' on' : ''}" data-act="toggle-sel" data-id="${ep.id}" aria-pressed="${isSel}" aria-label="${isSel ? 'Quitar de la selección' : 'Seleccionar'}">${icon(isSel ? 'checkfill' : 'circle')}</button>`
-      : `<button class="grip" data-grip="1" aria-label="Mantén pulsado y arrastra para cambiar el orden">${icon('grip')}</button>`;
+    lead = `<button class="grip" data-grip="1" aria-label="Mantén pulsado y arrastra para cambiar el orden">${icon('grip')}</button>`;
     side = dlBtn(ep.id);
-  } else {
-    if (o.sel) lead = `<button class="chk${isSel ? ' on' : ''}" data-act="toggle-sel" data-id="${ep.id}" aria-pressed="${isSel}" aria-label="${isSel ? 'Quitar de la selección' : 'Seleccionar'}">${icon(isSel ? 'checkfill' : 'circle')}</button>`;
+  } else if (!o.dl) {
     side = `<button class="icon-btn" data-act="add-to-list" data-id="${ep.id}" aria-label="Añadir a una lista">${icon('plus')}</button>${dlBtn(ep.id)}`;
   }
   const lst = o.list ? ` data-list="${o.list}" data-i="${o.i}" data-lp="1"` : ' data-lp="1"';
-  return `<li class="ep${on ? ' on' : ''}${isSel ? ' sel' : ''}">${lead}<button class="ep-main" data-act="play-ep" data-id="${ep.id}"${lst}>${epCover(ep)}<span class="ep-text"><span class="ep-title">${esc(ep.title)}</span><span class="ep-meta">${esc(meta)}</span>${stateTxt ? `<span class="ep-state">${stateTxt}</span>` : ''}${pct > 0 && !(p && p.done) ? `<span class="bar"><i style="width:${pct}%"></i></span>` : ''}</span></button><div class="ep-side">${side}</div></li>`;
+  const swipe = o.list ? ` data-swipe="item" data-list="${o.list}" data-epid="${ep.id}"` : '';
+  const under = o.list ? `<div class="swipe-under" aria-hidden="true">${icon('trash')}</div>` : '';
+  return `<li class="ep${o.list ? ' swipe' : ''}${on ? ' on' : ''}${isSel ? ' sel' : ''}"${swipe}>${under}<div class="row">${lead}<button class="ep-main" data-act="open-ep" data-id="${ep.id}"${lst}>${epCover(ep)}<span class="ep-text"><span class="ep-title">${esc(ep.title)}</span><span class="ep-meta">${esc(meta)}</span>${stateTxt ? `<span class="ep-state">${stateTxt}</span>` : ''}${pct > 0 && !(p && p.done) ? `<span class="bar"><i style="width:${pct}%"></i></span>` : ''}</span></button><div class="ep-side">${side}</div></div></li>`;
+}
+
+/* Barra superior mientras se selecciona (sin círculos: el episodio se ve en gris) */
+function selBar(kind) {
+  const b = (act, ic, label) => `<button class="icon-btn" data-act="${act}" aria-label="${label}">${icon(ic)}</button>`;
+  const btns = kind === 'list'
+    ? b('sel-all', 'checkall', 'Seleccionar todos') + b('sel-dl', 'down', 'Descargar seleccionados') + b('sel-remove', 'trash', 'Quitar seleccionados')
+    : kind === 'show'
+      ? b('sel-all', 'checkall', 'Seleccionar todos los que se ven') + b('sel-dl', 'down', 'Descargar seleccionados') + b('sel-add', 'plus', 'Añadir seleccionados a una lista')
+      : b('sel-all', 'checkall', 'Seleccionar todos') + b('sel-remove', 'trash', 'Borrar seleccionados');
+  return `<header class="top sub sel-bar"><button class="icon-btn" data-act="sel-cancel" aria-label="Cancelar selección">${icon('close')}</button><b class="sel-count">${sel.size} seleccionado${sel.size === 1 ? '' : 's'}</b><div class="top-actions">${btns}</div></header>`;
 }
 
 function showEpsToShow(s) {
@@ -682,13 +752,13 @@ function viewShow() {
   if (!s || s.del) return viewShows();
   const selecting = sel.size > 0;
   const head = selecting
-    ? `<header class="top sub sel-bar"><button class="icon-btn" data-act="sel-cancel" aria-label="Cancelar selección">${icon('close')}</button><b class="sel-count">${sel.size} seleccionado${sel.size === 1 ? '' : 's'}</b><div class="top-actions"><button class="icon-btn" data-act="sel-all" aria-label="Seleccionar todos los que se ven">${icon('checkall')}</button><button class="icon-btn" data-act="sel-dl" aria-label="Descargar seleccionados">${icon('down')}</button><button class="icon-btn" data-act="sel-add" aria-label="Añadir seleccionados a una lista">${icon('plus')}</button></div></header>`
+    ? selBar('show')
     : `<header class="top sub">${back}<div class="top-actions"><button class="icon-btn" data-act="refresh-show" data-id="${s.id}" aria-label="Actualizar">${icon('refresh')}</button><button class="icon-btn" data-act="remove-show" data-id="${s.id}" aria-label="Quitar programa">${icon('trash')}</button></div></header>`;
   const hasEps = (feeds[s.id]?.episodes || []).length > 0;
   return `<div class="page">${head}
   <div class="hero">${cover(s.image, s.title, 'cover lg')}<div><h1 class="hero-title">${esc(s.title)}</h1><p class="muted">${esc(s.author || '')}</p></div></div>
   ${hasEps ? `<input class="field" data-bind="epq" type="text" placeholder="Buscar en los episodios…" value="${esc(ui.epq || '')}" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="search" aria-label="Buscar en los episodios">` : ''}
-  ${hasEps && !selecting && !ui.epq ? '<p class="muted tip">Mantén pulsado un episodio para seleccionar varios.</p>' : ''}
+  ${hasEps && !selecting && !ui.epq ? '<p class="muted tip">Toca un episodio para ver su descripción. Mantenlo pulsado para seleccionar varios.</p>' : ''}
   <div id="show-eps">${showListHtml(s)}</div></div>`;
 }
 function updateShowList() {
@@ -699,9 +769,9 @@ function updateShowList() {
 function viewLists() {
   const ls = visibleLists();
   const body = ls.length
-    ? `<ul class="cards">${ls.map((l) => {
+    ? `<ul class="cards" data-kind="lists">${ls.map((l) => {
         const n = l.items.length, d = l.items.filter((id) => downloaded.has(id)).length;
-        return `<li><button class="card" data-act="open-list" data-id="${l.id}"><span class="card-title">${esc(l.name)}</span><span class="card-sub">${n} ${n === 1 ? 'episodio' : 'episodios'}${n ? `, ${d} descargado${d === 1 ? '' : 's'}` : ''}</span></button></li>`;
+        return `<li class="swipe" data-swipe="list" data-id="${l.id}"><div class="swipe-under" aria-hidden="true">${icon('trash')}</div><div class="row"><button class="grip" data-grip="1" aria-label="Mantén pulsado y arrastra para cambiar el orden">${icon('grip')}</button><button class="card" data-act="open-list" data-id="${l.id}"><span class="card-title">${esc(l.name)}</span><span class="card-sub">${n} ${n === 1 ? 'episodio' : 'episodios'}${n ? `, ${d} descargado${d === 1 ? '' : 's'}` : ''}</span></button></div></li>`;
       }).join('')}</ul>`
     : empty('Todavía no tienes listas', 'Crea una y añade los episodios que quieras escuchar mientras corres.', '<button class="btn primary" data-act="new-list">Crear lista</button>');
   return `<div class="page"><header class="top"><h1>Listas</h1><button class="icon-btn" data-act="new-list" aria-label="Nueva lista">${icon('plus')}</button></header>${body}</div>`;
@@ -719,13 +789,27 @@ function viewList() {
     ? `<div class="list-actions"><button class="btn primary" data-act="list-play" data-id="${l.id}">${icon('play')} Reproducir</button><button class="btn" data-act="list-dl-all" data-id="${l.id}">${icon('down')} Descargar todo</button></div>`
     : '';
   const head = selecting
-    ? `<header class="top sub sel-bar"><button class="icon-btn" data-act="sel-cancel" aria-label="Cancelar selección">${icon('close')}</button><b class="sel-count">${sel.size} seleccionado${sel.size === 1 ? '' : 's'}</b><div class="top-actions"><button class="icon-btn" data-act="sel-all" aria-label="Seleccionar todos">${icon('checkall')}</button><button class="icon-btn" data-act="sel-dl" aria-label="Descargar seleccionados">${icon('down')}</button><button class="icon-btn" data-act="sel-remove" aria-label="Quitar seleccionados">${icon('trash')}</button></div></header>`
+    ? selBar('list')
     : `<header class="top sub">${back}<div class="top-actions"><button class="icon-btn" data-act="list-menu" data-id="${l.id}" aria-label="Más opciones">${icon('more')}</button></div></header>`;
   return `<div class="page">${head}
   <h1 class="hero-title" style="font-size:28px;margin-bottom:12px">${esc(l.name)}</h1>
   ${selecting ? '' : actions}
-  ${l.items.length > 1 && !selecting ? '<p class="muted tip">Arrastra las rayas de la izquierda para ordenar. Mantén pulsado un episodio para seleccionar.</p>' : ''}
-  ${l.items.length ? `<ul class="eps compact">${rows}</ul>` : empty('Lista vacía', 'Abre un programa y toca + en los episodios que quieras añadir.', '<button class="btn primary" data-act="tab" data-tab="shows">Ver programas</button>')}</div>`;
+  ${l.items.length ? `<ul class="eps compact" data-kind="items">${rows}</ul>` : empty('Lista vacía', 'Abre un programa y toca + en los episodios que quieras añadir.', '<button class="btn primary" data-act="tab" data-tab="shows">Ver programas</button>')}</div>`;
+}
+
+function downloadedIds() {
+  return Array.from(downloaded).sort((a, b) => (dlMeta[b]?.at || 0) - (dlMeta[a]?.at || 0));
+}
+function viewDownloads() {
+  const ids = downloadedIds();
+  const selecting = sel.size > 0;
+  const total = ids.reduce((a, id) => a + (dlMeta[id]?.size || 0), 0);
+  const head = selecting ? selBar('dl') : `<header class="top sub">${back}<div class="top-actions"></div></header>`;
+  const rows = ids.map((id) => epRow(findEp(id) || { id, title: 'Episodio descargado', showId: '' }, { dl: true, sel: selecting })).join('');
+  return `<div class="page">${head}
+  <h1 class="hero-title" style="font-size:28px;margin-bottom:4px">Descargas</h1>
+  <p class="muted" style="margin-bottom:10px">${ids.length} episodio${ids.length === 1 ? '' : 's'}, ${fmtBytes(total)}</p>
+  ${ids.length ? `<ul class="eps compact">${rows}</ul>` : empty('No hay descargas', 'Descarga episodios desde un programa o una lista para escucharlos sin conexión.', '')}</div>`;
 }
 
 function viewSettings() {
@@ -755,7 +839,7 @@ function viewSettings() {
     <div class="inline" style="margin-top:12px"><input class="field" data-bind="rss" placeholder="https://…/feed.xml" value="${esc(ui.rss)}" autocapitalize="off" autocorrect="off" spellcheck="false" inputmode="url" aria-label="Dirección RSS"><button class="btn" data-act="add-rss">Añadir</button></div></section>
   <section class="sect"><h2>Mis programas</h2>
     ${mine.length ? `<ul class="results" style="margin-top:6px">${mine.map((s) => `<li class="result">${cover(s.image, s.title, 'thumb')}<span class="ep-text"><span class="ep-title">${esc(s.title)}</span></span><button class="icon-btn" data-act="remove-show" data-id="${s.id}" aria-label="Quitar ${esc(s.title)}">${icon('trash')}</button></li>`).join('')}</ul>` : '<p>Todavía no hay ninguno.</p>'}</section>
-  <section class="sect"><h2>Descargas</h2><p id="storage-info"></p>
+  <section class="sect"><h2>Descargas</h2><div class="dl-line"><p id="storage-info"></p><button class="btn" data-act="open-dl">Ver episodios</button></div>
     <label class="switch"><span>Borrar la descarga al terminar un episodio</span><input type="checkbox" data-act="toggle-autodel" ${cfg.autoDelete ? 'checked' : ''}></label>
     <button class="btn danger wide" data-act="clear-dl" style="margin-top:8px">Borrar todas las descargas</button></section>
   ${hint}</div>`;
@@ -765,17 +849,19 @@ function renderView() {
   if (drag) return;
   const v = $('#view');
   if (document.activeElement && document.activeElement.matches('#view input[type="text"], #view input:not([type]), #view input[type="password"]')) return;
-  const keep = v.dataset.key === JSON.stringify([route.tab, route.show, route.list]) ? v.scrollTop : 0;
+  const key = JSON.stringify([route.tab, route.show, route.list, route.dl]);
+  const keep = v.dataset.key === key ? v.scrollTop : 0;
   let html;
   if (route.show) html = viewShow();
   else if (route.list) html = viewList();
+  else if (route.dl) html = viewDownloads();
   else if (route.tab === 'lists') html = viewLists();
   else if (route.tab === 'settings') html = viewSettings();
   else html = viewShows();
   v.innerHTML = html;
-  v.dataset.key = JSON.stringify([route.tab, route.show, route.list]);
+  v.dataset.key = key;
   v.scrollTop = keep;
-  if (route.tab === 'settings' && !route.show && !route.list) refreshStorageInfo();
+  if (route.tab === 'settings' && !route.show && !route.list && !route.dl) refreshStorageInfo();
 }
 function renderTabs() {
   const t = route.show ? 'shows' : route.list ? 'lists' : route.tab;
@@ -801,13 +887,17 @@ function renderPlayer() {
   p.innerHTML = `<div class="p-top"><button class="icon-btn" data-act="close-player" aria-label="Cerrar reproductor">${icon('chevd')}</button><span>Reproduciendo</span><button class="icon-btn" data-act="add-to-list" data-id="${cur.id}" aria-label="Añadir a una lista">${icon('plus')}</button></div>
     ${epCover(cur, 'cover p-cover')}
     <h2 class="p-title">${esc(cur.title)}</h2><p class="p-show">${esc(s?.title || '')}</p>
-    <div class="p-time"><b id="p-cur">0:00</b><span id="p-left"></span></div>
+    <div class="p-time"><b id="p-cur">0:00</b><span id="p-total"></span></div>
     <input id="p-range" type="range" min="0" max="1000" value="0" aria-label="Posición">
     <div class="transport">
-      <button class="icon-btn rate" id="p-rate" data-act="rate" aria-label="Velocidad">${cfg.rate}×</button>
+      <button class="icon-btn pn" data-act="ep-prev" aria-label="Episodio anterior">${icon('prev')}</button>
       <button class="icon-btn skip" data-act="skip" data-d="-${SKIP}" aria-label="Retroceder ${SKIP} segundos">${icon('back')}</button>
       <button class="icon-btn play" data-act="toggle-play" aria-label="Reproducir o pausar">${icon(A.paused ? 'play' : 'pause')}</button>
       <button class="icon-btn skip" data-act="skip" data-d="${SKIP}" aria-label="Adelantar ${SKIP} segundos">${icon('fwd')}</button>
+      <button class="icon-btn pn" data-act="ep-next" aria-label="Episodio siguiente">${icon('next')}</button>
+    </div>
+    <div class="transport2">
+      <button class="icon-btn rate" id="p-rate" data-act="rate" aria-label="Velocidad">${cfg.rate}×</button>
       ${dlBtn(cur.id)}
     </div>`;
   onTime();
@@ -946,11 +1036,18 @@ const actions = {
     closeSheet(); removeShow(id);
     if (route.show === id) history.back(); else render();
   },
-  'play-ep': (el, id) => {
+  'open-ep': (el, id) => {
     if (sel.size) { toggleSel(id); return; }
+    openEpSheet(id, el.dataset.list, el.dataset.i);
+  },
+  'play-sheet': (el, id) => {
     const l = el.dataset.list && state.playlists[el.dataset.list];
+    closeSheet();
     if (l) playEp(id, l.items.slice(+el.dataset.i)); else playEp(id);
   },
+  'ep-prev': () => prevEp(),
+  'ep-next': () => nextEp(),
+  'open-dl': () => go({ tab: 'settings', dl: true }),
   'add-to-list': (el, id) => pickListSheet([id]),
   'add-to': (el) => {
     const ids = pendingIds.slice(), fromSel = pendingSel;
@@ -974,7 +1071,8 @@ const actions = {
   'sel-all': () => {
     unfocus();
     let ids = [];
-    if (route.show) { const s = state.shows[route.show]; ids = s ? showEpsToShow(s).shown.map((e) => e.id) : []; }
+    if (route.dl) ids = downloadedIds();
+    else if (route.show) { const s = state.shows[route.show]; ids = s ? showEpsToShow(s).shown.map((e) => e.id) : []; }
     else { const l = state.playlists[route.list]; ids = l ? l.items.slice() : []; }
     if (ids.length && ids.every((x) => sel.has(x))) { exitSel(); return; }
     ids.forEach((x) => sel.add(x)); render();
@@ -984,15 +1082,24 @@ const actions = {
   'sel-dl': () => { const n = sel.size; Array.from(sel).forEach(enqueueDl); toast(`Descargando ${n} episodio${n === 1 ? '' : 's'}`); exitSel(); },
   'sel-remove': () => {
     const n = sel.size, ids = Array.from(sel);
+    if (route.dl) {
+      sheet(`<h2>${n} episodio${n === 1 ? '' : 's'} descargado${n === 1 ? '' : 's'}</h2>
+        <p>"Borrar la descarga" libera espacio, pero el episodio se queda en sus listas. "Borrar episodio y descarga" también lo quita de todas las listas.</p>
+        <div class="row-stack"><button class="btn danger wide" data-act="dl-del-files">Borrar la descarga</button>
+        <button class="btn danger wide" data-act="dl-del-all">Borrar episodio y descarga</button>
+        <button class="btn wide" data-act="close-sheet">Cancelar</button></div>`);
+      return;
+    }
     const withDl = ids.filter((x) => downloaded.has(x) && !inOtherLists(x, route.list)).length;
     const shared = ids.filter((x) => downloaded.has(x) && inOtherLists(x, route.list)).length;
-    sheet(`<h2>Quitar ${n} episodio${n === 1 ? '' : 's'} de la lista</h2><p>Siguen disponibles en su programa.${shared ? ' Los que están también en otras listas conservan su descarga.' : ''}</p>
+    const extra = withDl ? ` También se borrará ${withDl === 1 ? 'su descarga' : 'la descarga de ' + withDl}.` : '';
+    sheet(`<h2>Quitar ${n} episodio${n === 1 ? '' : 's'} de la lista</h2><p>Siguen disponibles en su programa.${extra}${shared ? ' Los que están también en otras listas conservan su descarga.' : ''}</p>
       <div class="row-stack"><button class="btn danger wide" data-act="sel-remove-ok">Quitar de la lista</button>
-      ${withDl ? `<button class="btn danger wide" data-act="sel-remove-dl">Quitar y borrar ${withDl === 1 ? 'la descarga' : 'las ' + withDl + ' descargas'}</button>` : ''}
       <button class="btn wide" data-act="close-sheet">Cancelar</button></div>`);
   },
-  'sel-remove-ok': () => removeSelected(false),
-  'sel-remove-dl': () => removeSelected(true),
+  'sel-remove-ok': () => removeSelected(),
+  'dl-del-files': () => deleteDownloads(Array.from(sel), false),
+  'dl-del-all': () => deleteDownloads(Array.from(sel), true),
   'list-menu': (el, id) => sheet(`<h2>${esc(state.playlists[id]?.name || '')}</h2><ul class="sheet-list"><li><button data-act="list-rename" data-id="${id}">Cambiar nombre</button></li><li><button data-act="list-delete" data-id="${id}">Eliminar lista</button></li></ul><button class="btn wide" data-act="close-sheet">Cerrar</button>`),
   'list-rename': async (el, id) => {
     const l = state.playlists[id]; closeSheet();
@@ -1066,16 +1173,35 @@ function toggleSel(id) {
   if (sel.has(id)) sel.delete(id); else sel.add(id);
   if (!sel.size) exitSel(); else render();
 }
-function removeSelected(alsoDownloads) {
+function removeSelected() {
   const l = state.playlists[route.list];
   const ids = new Set(sel);
   closeSheet();
   if (!l) return;
   l.items = l.items.filter((x) => !ids.has(x));
   l.mod = now(); touch();
-  if (alsoDownloads) ids.forEach((x) => { if (downloaded.has(x) && !inOtherLists(x, l.id)) deleteDl(x); });
+  ids.forEach((x) => { if (downloaded.has(x) && !inOtherLists(x, l.id)) deleteDl(x); });
   toast(`Quitado${ids.size === 1 ? '' : 's'} ${ids.size} episodio${ids.size === 1 ? '' : 's'}`);
   exitSel();
+}
+async function deleteDownloads(ids, alsoFromLists) {
+  closeSheet();
+  for (const id of ids) {
+    if (alsoFromLists) removeEverywhere(id);
+    try { await deleteDl(id); } catch (e) { console.warn(e); }
+  }
+  toast(alsoFromLists ? `Borrado${ids.length === 1 ? '' : 's'} ${ids.length} episodio${ids.length === 1 ? '' : 's'} y su descarga` : `Borrada${ids.length === 1 ? '' : 's'} ${ids.length} descarga${ids.length === 1 ? '' : 's'}`);
+  exitSel();
+}
+function openEpSheet(id, listId, idx) {
+  const ep = findEp(id);
+  if (!ep) return;
+  const s = state.shows[ep.showId];
+  const meta = [s && s.title, fmtDate(ep.pub), fmtDur(ep.dur)].filter(Boolean).join(' - ');
+  const desc = ep.desc ? esc(ep.desc).replace(/\n/g, '<br>') : '<span class="muted">Este episodio no tiene descripción.</span>';
+  const gone = ep.gone && !downloaded.has(id) ? '<p class="muted small">Este episodio ya no está en el RSS del programa: puede que no se pueda reproducir.</p>' : '';
+  const ctx = listId ? ` data-list="${listId}" data-i="${idx}"` : '';
+  sheet(`<div class="es-head">${epCover(ep, 'thumb')}<div class="es-text"><h2>${esc(ep.title)}</h2><p>${esc(meta)}</p></div><button class="icon-btn es-play" data-act="play-sheet" data-id="${id}"${ctx} aria-label="Reproducir">${icon('play')}</button></div><div class="desc">${desc}</div>${gone}`);
 }
 
 /* Pulsación larga (1 s) sobre un episodio de una lista: empieza la selección */
@@ -1110,20 +1236,24 @@ document.addEventListener('contextmenu', (e) => { if (e.target.closest('.ep-main
 
 /* ---------- Arrastrar para ordenar (rayas de la izquierda) ---------- */
 let drag = null;
+let sw = null;
 document.addEventListener('pointerdown', (e) => {
   const g = e.target.closest('[data-grip]');
-  if (!g || (e.pointerType === 'mouse' && e.button !== 0)) return;
-  const li = g.closest('li.ep');
+  if (!g || sel.size || (e.pointerType === 'mouse' && e.button !== 0)) return;
+  const li = g.closest('li');
   const ul = li && li.parentElement;
-  if (!ul || !route.list) return;
+  const kind = ul && ul.dataset.kind;
+  if (!kind) return;
   if (lp) { lp.cancel(); lp = null; }
+  sw = null;
   const rows = Array.from(ul.children);
   const view = $('#view');
+  const gap = rows.length > 1 ? Math.max(0, rows[1].offsetTop - rows[0].offsetTop - rows[0].offsetHeight) : 0;
   drag = {
-    pid: e.pointerId, li, rows, view,
+    kind, pid: e.pointerId, li, rows, view,
     from: rows.indexOf(li), to: rows.indexOf(li),
     tops: rows.map((r) => r.offsetTop), hs: rows.map((r) => r.offsetHeight),
-    h: li.offsetHeight, y0: e.clientY, y: e.clientY, s0: view.scrollTop, raf: 0,
+    h: li.offsetHeight, step: li.offsetHeight + gap, y0: e.clientY, y: e.clientY, s0: view.scrollTop, raf: 0,
   };
   try { g.setPointerCapture(e.pointerId); } catch {}
   li.classList.add('dragging');
@@ -1150,8 +1280,8 @@ function dragLoop() {
     d.rows.forEach((row, i) => {
       if (i === d.from) return;
       let t = '';
-      if (to > d.from && i > d.from && i <= to) t = `translateY(${-d.h}px)`;
-      else if (to < d.from && i < d.from && i >= to) t = `translateY(${d.h}px)`;
+      if (to > d.from && i > d.from && i <= to) t = `translateY(${-d.step}px)`;
+      else if (to < d.from && i < d.from && i >= to) t = `translateY(${d.step}px)`;
       row.style.transform = t;
     });
   }
@@ -1164,11 +1294,60 @@ function dragEnd(e) {
   cancelAnimationFrame(d.raf);
   drag = null;
   d.rows.forEach((r) => { r.style.transform = ''; r.classList.remove('shifting', 'dragging'); });
-  if (e.type !== 'pointercancel' && d.to !== d.from) moveItemTo(route.list, d.from, d.to);
+  if (e.type !== 'pointercancel' && d.to !== d.from) { if (d.kind === 'lists') moveList(d.from, d.to); else moveItemTo(route.list, d.from, d.to); }
   render();
 }
 document.addEventListener('pointerup', dragEnd);
 document.addEventListener('pointercancel', dragEnd);
+
+/* ---------- Deslizar a la izquierda: quitar un episodio de la lista / borrar una lista (con confirmación) ---------- */
+document.addEventListener('pointerdown', (e) => {
+  if (sel.size || drag || (e.pointerType === 'mouse' && e.button !== 0)) return;
+  const li = e.target.closest('li[data-swipe]');
+  if (!li || e.target.closest('[data-grip], .dl, .icon-btn, input')) return;
+  sw = { pid: e.pointerId, li, row: li.querySelector(':scope > .row'), x0: e.clientX, y0: e.clientY, dx: 0, active: false, w: li.offsetWidth || 360 };
+});
+document.addEventListener('pointermove', (e) => {
+  const d = sw;
+  if (!d || e.pointerId !== d.pid) return;
+  const dx = e.clientX - d.x0, dy = e.clientY - d.y0;
+  if (!d.active) {
+    if (dx < -12 && Math.abs(dx) > Math.abs(dy) * 1.6) {
+      d.active = true; d.li.classList.add('swiping');
+      if (lp) { lp.cancel(); lp = null; }
+      try { d.li.setPointerCapture(e.pointerId); } catch {}
+    } else if (Math.abs(dy) > 12 || dx > 12) { sw = null; return; }
+    else return;
+  }
+  d.dx = Math.min(0, dx);
+  d.row.style.transform = `translateX(${d.dx}px)`;
+});
+function swipeEnd(e) {
+  const d = sw;
+  if (!d || e.pointerId !== d.pid) return;
+  sw = null;
+  if (!d.active) return;
+  lpFired = true;                                   // el clic de al soltar no debe abrir el episodio
+  setTimeout(() => { lpFired = false; }, 120);
+  d.li.classList.remove('swiping');
+  const far = e.type !== 'pointercancel' && d.dx < -Math.min(140, d.w * 0.4);
+  const snap = () => {
+    d.row.style.transition = 'transform .18s ease';
+    d.row.style.transform = '';
+    setTimeout(() => { d.row.style.transition = ''; }, 220);
+  };
+  if (!far) { snap(); return; }
+  if (d.li.dataset.swipe === 'item') {
+    d.row.style.transition = 'transform .15s ease';
+    d.row.style.transform = 'translateX(-110%)';
+    setTimeout(() => removeItemFromList(d.li.dataset.list, d.li.dataset.epid), 150);
+  } else {
+    snap();
+    askDeleteList(d.li.dataset.id);
+  }
+}
+document.addEventListener('pointerup', swipeEnd);
+document.addEventListener('pointercancel', swipeEnd);
 
 document.addEventListener('click', (e) => {
   const el = e.target.closest('[data-act]');

@@ -107,7 +107,8 @@ h1, h2, p { margin: 0; }
 
 /* Episodios */
 .eps { list-style: none; margin: 0; padding: 0; position: relative; }
-.ep { display: flex; align-items: center; gap: 4px; border-top: 1px solid var(--line); padding: 10px 0; position: relative; transition: background 0.15s; }
+.ep { border-top: 1px solid var(--line); padding: 10px 0; position: relative; transition: background 0.15s; }
+.row { display: flex; align-items: center; gap: 4px; width: 100%; position: relative; }
 .ep-main { display: flex; gap: 12px; align-items: center; flex: 1; min-width: 0; min-height: 56px; }
 .ep-text { display: flex; flex-direction: column; min-width: 0; gap: 2px; }
 .ep-title { font-weight: 600; line-height: 1.25; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
@@ -232,7 +233,7 @@ h1, h2, p { margin: 0; }
 @media (prefers-reduced-motion: reduce) { .ep.shifting, .ep.pressing { transition: none; } }
 
 /* Episodios dentro de las listas: un 25 % más bajos */
-.eps.compact .ep { padding: 5px 0; gap: 2px; }
+.eps.compact .ep { padding: 5px 0; }
 .eps.compact .ep-main { min-height: 44px; gap: 10px; }
 .eps.compact .thumb { width: 42px; height: 42px; border-radius: 7px; }
 .eps.compact .thumb b { font-size: 14px; }
@@ -244,3 +245,39 @@ h1, h2, p { margin: 0; }
 .eps.compact .icon-btn { width: 38px; height: 44px; }
 .eps.compact .ic { width: 22px; height: 22px; }
 .eps .chk { width: 40px; height: 56px; }
+
+/* Deslizar para borrar */
+.swipe { overflow: hidden; touch-action: pan-y; }
+.swipe-under { position: absolute; inset: 0; display: flex; align-items: center; justify-content: flex-end; padding-right: 22px; background: var(--danger); color: #fff; opacity: 0; pointer-events: none; }
+.swipe.swiping .swipe-under { opacity: 1; }
+.swipe.swiping .row { background: var(--bg); }
+.cards .swipe { border-radius: 12px; }
+.cards .row { gap: 2px; }
+.cards .row .card { flex: 1; width: auto; min-width: 0; }
+.cards .grip { height: 48px; width: 34px; }
+.cards { position: relative; }
+
+/* Ficha del episodio (descripción) */
+.es-head { display: flex; align-items: center; gap: 12px; }
+.es-head .thumb { width: 52px; height: 52px; }
+.es-text { flex: 1; min-width: 0; }
+.es-text h2 { font-size: 16px; line-height: 1.25; margin-bottom: 2px; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.es-text p { font-size: 13px; margin: 0; }
+.es-play { width: 52px; height: 52px; background: var(--accent); color: var(--on-accent); }
+.es-play:active { background: var(--accent); opacity: 0.85; }
+.desc { margin-top: 14px; font-size: 15px; line-height: 1.5; max-height: 48vh; overflow-y: auto; }
+.small { font-size: 13px; margin-top: 10px; }
+
+/* Reproductor: anterior / siguiente y tiempo total */
+.p-time span { font-size: 18px; }
+.transport { justify-content: space-between; }
+.transport .pn { width: 48px; height: 48px; }
+.transport .skip { width: 60px; height: 60px; }
+.transport .skip .ic { width: 40px; height: 40px; }
+.transport .play { width: 80px; height: 80px; }
+.transport .play .ic { width: 42px; height: 42px; }
+.transport2 { display: flex; align-items: center; justify-content: center; gap: 28px; padding-top: 14px; }
+
+/* Ajustes: descargas */
+.dl-line { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 4px; }
+.dl-line p { margin: 0; color: var(--muted); font-size: 14px; }
