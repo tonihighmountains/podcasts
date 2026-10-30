@@ -3,6 +3,7 @@
 /* =====================================================================
    Utilidades
    ===================================================================== */
+const APP_VERSION = 'v8';
 const SKIP = 30;
 const RATES = [1, 1.25, 1.5, 1.75, 2];
 const $ = (s, el = document) => el.querySelector(s);
@@ -842,6 +843,8 @@ function viewSettings() {
   <section class="sect"><h2>Descargas</h2><div class="dl-line"><p id="storage-info"></p><button class="btn" data-act="open-dl">Ver episodios</button></div>
     <label class="switch"><span>Borrar la descarga al terminar un episodio</span><input type="checkbox" data-act="toggle-autodel" ${cfg.autoDelete ? 'checked' : ''}></label>
     <button class="btn danger wide" data-act="clear-dl" style="margin-top:8px">Borrar todas las descargas</button></section>
+  <section class="sect"><h2>Aplicación</h2><div class="dl-line"><p>Versión ${APP_VERSION}</p><button class="btn" data-act="update-app">Actualizar la app</button></div>
+    <p class="status">Borra la copia guardada de la app y la vuelve a cargar. No toca tus descargas, listas ni programas.</p></section>
   ${hint}</div>`;
 }
 
@@ -874,9 +877,11 @@ function renderMini() {
   const s = state.shows[cur.showId];
   m.hidden = false;
   m.innerHTML = `<button class="mini-main" data-act="open-player">${epCover(cur)}<span class="mini-text"><span class="mini-title">${esc(cur.title)}</span><span class="mini-sub">${esc(s?.title || '')}</span></span></button>
-    <button class="icon-btn" data-act="skip" data-d="-${SKIP}" aria-label="Retroceder ${SKIP} segundos">${icon('back')}</button>
+    <button class="icon-btn pn" data-act="ep-prev" aria-label="Episodio anterior">${icon('prev')}</button>
+    <button class="icon-btn skip" data-act="skip" data-d="-${SKIP}" aria-label="Retroceder ${SKIP} segundos">${icon('back')}</button>
     <button class="icon-btn play" data-act="toggle-play" aria-label="Reproducir o pausar">${icon(A.paused ? 'play' : 'pause')}</button>
-    <button class="icon-btn" data-act="skip" data-d="${SKIP}" aria-label="Adelantar ${SKIP} segundos">${icon('fwd')}</button>
+    <button class="icon-btn skip" data-act="skip" data-d="${SKIP}" aria-label="Adelantar ${SKIP} segundos">${icon('fwd')}</button>
+    <button class="icon-btn pn" data-act="ep-next" aria-label="Episodio siguiente">${icon('next')}</button>
     <div class="mini-bar"><i id="mini-bar"></i></div>`;
   onTime();
 }
@@ -1048,6 +1053,14 @@ const actions = {
   'ep-prev': () => prevEp(),
   'ep-next': () => nextEp(),
   'open-dl': () => go({ tab: 'settings', dl: true }),
+  'update-app': async () => {
+    toast('Actualizando la app…');
+    try {
+      if ('serviceWorker' in navigator) (await navigator.serviceWorker.getRegistrations()).forEach((r) => r.unregister());
+      if (window.caches) (await caches.keys()).forEach((k) => caches.delete(k));
+    } catch (e) { console.warn(e); }
+    setTimeout(() => location.reload(), 500);
+  },
   'add-to-list': (el, id) => pickListSheet([id]),
   'add-to': (el) => {
     const ids = pendingIds.slice(), fromSel = pendingSel;
