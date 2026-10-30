@@ -78,7 +78,7 @@ const jset = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } cat
 let state = Object.assign({ shows: {}, playlists: {}, episodes: {}, pos: {} }, jget(LS.state, {}));
 // Configuración de este dispositivo
 let cfg = Object.assign({ worker: '', key: '', rate: 1, autoDelete: false, lastSync: 0, last: null }, jget(LS.cfg, {}));
-let feeds = jget(LS.feeds, {});          // showId -> { at, episodes: [] }
+let feeds = {};                          // showId -> { at, episodes: [] } (se guarda en IndexedDB)
 let dlMeta = jget(LS.dl, {});            // epId -> { size, at }
 let downloaded = new Set();              // epId descargados en este dispositivo (IndexedDB)
 const dlProg = {};                       // epId -> progreso (0..1, -1 = en cola/desconocido)
@@ -97,17 +97,21 @@ const visibleLists = () => Object.values(state.playlists).filter((l) => !l.del).
 let dbp;
 function db() {
   return (dbp ||= new Promise((res, rej) => {
-    const r = indexedDB.open('podcast-db', 1);
-    r.onupgradeneeded = () => r.result.createObjectStore('audio');
+    const r = indexedDB.open('podcast-db', 2);
+    r.onupgradeneeded = () => {
+      const d = r.result;
+      if (!d.objectStoreNames.contains('audio')) d.createObjectStore('audio');
+      if (!d.objectStoreNames.contains('feeds')) d.createObjectStore('feeds');
+    };
     r.onsuccess = () => res(r.result);
     r.onerror = () => rej(r.error);
   }));
 }
-async function tx(mode, fn) {
+async function tx(mode, fn, store = 'audio') {
   const d = await db();
   return new Promise((res, rej) => {
-    const t = d.transaction('audio', mode);
-    const req = fn(t.objectStore('audio'));
+    const t = d.transaction(store, mode);
+    const req = fn(t.objectStore(store));
     t.oncomplete = () => res(req && req.result);
     t.onerror = () => rej(t.error);
     t.onabort = () => rej(t.error || new Error('Transacción cancelada'));
@@ -117,6 +121,23 @@ const idbGet = (k) => tx('readonly', (s) => s.get(k));
 const idbSet = (k, v) => tx('readwrite', (s) => s.put(v, k));
 const idbDel = (k) => tx('readwrite', (s) => s.delete(k));
 const idbKeys = () => tx('readonly', (s) => s.getAllKeys());
+const feedPut = (k, v) => tx('readwrite', (s) => s.put(v, k), 'feeds');
+const feedDel = (k) => tx('readwrite', (s) => s.delete(k), 'feeds');
+async function loadFeeds() {
+  try {
+    const keys = await tx('readonly', (s) => s.getAllKeys(), 'feeds');
+    const vals = await tx('readonly', (s) => s.getAll(), 'feeds');
+    keys.forEach((k, i) => { feeds[k] = vals[i]; });
+  } catch (e) { console.warn('No se pudieron leer los RSS guardados', e); }
+  // Migración desde la versión anterior (guardaba los RSS en localStorage)
+  const old = jget(LS.feeds, null);
+  if (old) {
+    for (const [k, v] of Object.entries(old)) {
+      if (!feeds[k]) { feeds[k] = v; try { await feedPut(k, v); } catch {} }
+    }
+    try { localStorage.removeItem(LS.feeds); } catch {}
+  }
+}
 
 async function reconcileDownloads() {
   try {
@@ -221,7 +242,7 @@ function parseFeed(xml, feedUrl) {
   const showId = hash(feedUrl);
   const image = child(ch, 'itunes:image')?.getAttribute('href') || childText(child(ch, 'image'), 'url') || '';
   const episodes = [];
-  for (const it of Array.from(ch.children).filter((c) => c.tagName === 'item').slice(0, 150)) {
+  for (const it of Array.from(ch.children).filter((c) => c.tagName === 'item').slice(0, 3000)) {
     const audio = child(it, 'enclosure')?.getAttribute('url');
     if (!audio) continue;
     const guid = childText(it, 'guid') || audio;
@@ -246,13 +267,13 @@ async function refreshShow(id, force = false) {
   const s = state.shows[id];
   if (!s || s.del) return;
   const c = feeds[id];
-  if (!force && c && now() - c.at < 10 * 60e3) return;
+  if (!force && c && now() - c.at < 30 * 60e3) return;
   loading[id] = true;
   try {
     const p = await fetchFeed(s.feed);
     feeds[id] = { at: now(), episodes: p.episodes };
     p.episodes.forEach((e) => epMap.set(e.id, e));
-    jset(LS.feeds, feeds);
+    feedPut(id, feeds[id]).catch((e) => console.warn('No se pudo guardar el RSS', e));
     if (!s.image && p.image) { s.image = p.image; s.mod = now(); touch(); }
   } catch (e) {
     if (force || !feeds[id]) toast(navigator.onLine ? 'No se pudo actualizar: ' + e.message : 'Sin conexión: se muestran los episodios guardados');
@@ -285,7 +306,7 @@ function removeShow(id) {
   const s = state.shows[id];
   if (!s) return;
   s.del = true; s.mod = now();
-  delete feeds[id]; jset(LS.feeds, feeds);
+  delete feeds[id]; feedDel(id).catch(() => {});
   touch();
 }
 function newList(name) {
@@ -637,7 +658,8 @@ function showEpsToShow(s) {
   const all = feeds[s.id]?.episodes || [];
   const q = (ui.epq || '').trim();
   const matches = filterEps(all, q);
-  return { all, q, matches, shown: q ? matches : matches.slice(0, ui.epN || 40) };
+  const limit = ui.epN || (q ? 100 : 40);
+  return { all, q, matches, shown: matches.slice(0, limit) };
 }
 function showListHtml(s) {
   const { all, q, matches, shown } = showEpsToShow(s);
@@ -645,10 +667,12 @@ function showListHtml(s) {
   if (!all.length) {
     return loading[s.id] ? '<p class="muted pad">Cargando episodios…</p>' : '<p class="muted pad">No hay episodios guardados. Conéctate y toca actualizar.</p>';
   }
+  const oldest = all.length ? all[all.length - 1].pub : 0;
+  const since = oldest ? `, el más antiguo de ${fmtDate(oldest)}` : '';
   const count = q
-    ? `<p class="muted tip">${matches.length} episodio${matches.length === 1 ? '' : 's'} con «${esc(q)}» (de los últimos ${all.length})</p>`
-    : '';
-  const more = !q && matches.length > shown.length
+    ? `<p class="muted tip">${matches.length} episodio${matches.length === 1 ? '' : 's'} con «${esc(q)}»${matches.length > shown.length ? `, se ven ${shown.length}` : ''}. Hay ${all.length} cargados${since}.</p>`
+    : `<p class="muted tip">${all.length} episodios cargados${since}.</p>`;
+  const more = matches.length > shown.length
     ? `<button class="btn wide" style="margin-top:12px" data-act="more-eps">Ver más episodios</button>` : '';
   const none = q && !matches.length ? '<p class="muted pad">Ningún episodio coincide. Prueba con menos palabras.</p>' : '';
   return `${count}${none}<ul class="eps">${shown.map((e) => epRow(e, { sel: selecting })).join('')}</ul>${more}`;
@@ -912,7 +936,7 @@ async function addRss() {
 const actions = {
   tab: (el) => { const t = el.dataset.tab; if (!route.show && !route.list && route.tab === t) { $('#view').scrollTop = 0; return; } go({ tab: t }); },
   back: () => history.back(),
-  'open-show': (el, id) => { ui.epq = ''; ui.epN = 40; go({ tab: 'shows', show: id }); },
+  'open-show': (el, id) => { ui.epq = ''; ui.epN = 0; go({ tab: 'shows', show: id }); },
   'open-list': (el, id) => go({ tab: 'lists', list: id }),
   'refresh-all': async () => { toast('Actualizando programas…'); await refreshAll(true); toast('Programas actualizados'); },
   'refresh-show': (el, id) => refreshShow(id, true),
@@ -956,7 +980,7 @@ const actions = {
     ids.forEach((x) => sel.add(x)); render();
   },
   'sel-add': () => pickListSheet(Array.from(sel), true),
-  'more-eps': () => { ui.epN = (ui.epN || 40) + 40; updateShowList(); },
+  'more-eps': () => { const q = (ui.epq || '').trim(); ui.epN = (ui.epN || (q ? 100 : 40)) + 60; updateShowList(); },
   'sel-dl': () => { const n = sel.size; Array.from(sel).forEach(enqueueDl); toast(`Descargando ${n} episodio${n === 1 ? '' : 's'}`); exitSel(); },
   'sel-remove': () => {
     const n = sel.size, ids = Array.from(sel);
@@ -1063,12 +1087,11 @@ document.addEventListener('pointerdown', (e) => {
   if (!m || (e.pointerType === 'mouse' && e.button !== 0)) return;
   const li = m.closest('li');
   const id = m.dataset.id;
-  const t = setTimeout(() => { li && li.classList.add('pressing'); }, 250);
+  const t = setTimeout(() => { li && li.classList.add('pressing'); }, 120);
   const t2 = setTimeout(() => {
     lp = null; lpFired = true;
-    if (navigator.vibrate) navigator.vibrate(25);
     enterSel(id);
-  }, 1000);
+  }, 500);
   lp = { pid: e.pointerId, x: e.clientX, y: e.clientY, li, cancel: () => { clearTimeout(t); clearTimeout(t2); li && li.classList.remove('pressing'); } };
 });
 document.addEventListener('pointermove', (e) => {
@@ -1105,7 +1128,6 @@ document.addEventListener('pointerdown', (e) => {
   try { g.setPointerCapture(e.pointerId); } catch {}
   li.classList.add('dragging');
   rows.forEach((r) => { if (r !== li) r.classList.add('shifting'); });
-  if (navigator.vibrate) navigator.vibrate(10);
   e.preventDefault();
   drag.raf = requestAnimationFrame(dragLoop);
 });
@@ -1164,7 +1186,7 @@ document.addEventListener('change', (e) => {
 document.addEventListener('input', (e) => {
   const t = e.target;
   if (t.dataset?.bind) ui[t.dataset.bind] = t.value;
-  if (t.dataset?.bind === 'epq') updateShowList();
+  if (t.dataset?.bind === 'epq') { ui.epN = 0; updateShowList(); }
   if (t.id === 'p-range' && isFinite(A.duration)) {
     scrubbing = true;
     updateScrubUI((t.value / 1000) * A.duration, A.duration);
@@ -1188,6 +1210,7 @@ window.addEventListener('online', () => { if (cfgOK()) sync(); });
    Arranque
    ===================================================================== */
 async function boot() {
+  await loadFeeds();
   Object.values(feeds).forEach((f) => (f.episodes || []).forEach((e) => epMap.set(e.id, e)));
   await reconcileDownloads();
   history.replaceState(route, '');

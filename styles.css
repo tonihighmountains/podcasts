@@ -223,7 +223,7 @@ h1, h2, p { margin: 0; }
 .ep-main, .ep-main * { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
 .ep-main .thumb img { pointer-events: none; -webkit-user-drag: none; }
 .ep.sel { background: var(--sel); }
-.ep.pressing { background: var(--sel); transition: background 0.75s linear; }
+.ep.pressing { background: var(--sel); transition: background 0.35s linear; }
 .ep.dragging { z-index: 5; background: var(--surface2); box-shadow: 0 8px 22px rgba(0, 0, 0, 0.35); transition: none; border-radius: 12px; }
 .ep.shifting { transition: transform 0.16s ease; }
 .sel-bar { background: var(--surface2); border-radius: 14px; padding: 0 6px; position: sticky; top: 4px; z-index: 6; margin-bottom: 8px; }
