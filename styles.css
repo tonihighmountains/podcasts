@@ -295,3 +295,9 @@ h1, h2, p { margin: 0; }
 .mini .pn .ic { width: 20px; height: 20px; }
 .mini .play { width: 46px; height: 46px; }
 .mini .play .ic { width: 26px; height: 26px; }
+
+/* Selección sin repintar: los avisos y acciones de la pantalla se ocultan por CSS */
+.page.selecting .list-actions, .page.selecting .hint-tip { display: none; }
+.scrim { cursor: pointer; touch-action: manipulation; }
+/* Programas: tres botones por episodio (añadir, reproducir, descargar) */
+.eps:not(.compact) .ep-side .icon-btn { width: 40px; }
