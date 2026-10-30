@@ -792,9 +792,32 @@ async function doSearch() {
   if (!cfgOK()) { toast('Primero configura el servidor y la clave'); return; }
   document.activeElement?.blur?.();
   ui.searching = true; render();
-  try { searchRes = await (await api('/search?term=' + encodeURIComponent(q))).json(); }
-  catch (e) { toast(e.message); searchRes = null; }
+  try {
+    try { searchRes = await (await api('/search?term=' + encodeURIComponent(q))).json(); }
+    catch (e1) {
+      // Si el puente falla (p. ej. Apple limita sus peticiones), se busca directamente desde este navegador
+      console.warn('Búsqueda por el puente falló:', e1.message);
+      searchRes = await itunesDirect(q);
+    }
+  } catch (e) { toast('No se pudo buscar. Prueba en unos minutos o pega el RSS.'); searchRes = null; }
   ui.searching = false; render();
+}
+function itunesDirect(term) {
+  return new Promise((resolve, reject) => {
+    const cb = 'itcb' + uid();
+    const s = document.createElement('script');
+    const clean = () => { clearTimeout(timer); delete window[cb]; s.remove(); };
+    const timer = setTimeout(() => { clean(); reject(new Error('Tiempo agotado')); }, 10000);
+    window[cb] = (d) => {
+      clean();
+      resolve((d.results || []).filter((r) => r.feedUrl).map((r) => ({
+        title: r.collectionName, author: r.artistName, image: r.artworkUrl600 || r.artworkUrl100 || '', feed: r.feedUrl,
+      })));
+    };
+    s.onerror = () => { clean(); reject(new Error('No se pudo buscar')); };
+    s.src = 'https://itunes.apple.com/search?media=podcast&entity=podcast&country=ES&limit=15&term=' + encodeURIComponent(term) + '&callback=' + cb;
+    document.head.appendChild(s);
+  });
 }
 async function addRss() {
   const url = ui.rss.trim();
