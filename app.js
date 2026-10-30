@@ -3,7 +3,7 @@
 /* =====================================================================
    Utilidades
    ===================================================================== */
-const APP_VERSION = 'v9';
+const APP_VERSION = 'v11';
 const SKIP = 30;
 const RATES = [1, 1.25, 1.5, 1.75, 2];
 const $ = (s, el = document) => el.querySelector(s);
@@ -429,13 +429,30 @@ async function runDl() {
   }
   dlRunning = false;
 }
+// Primero se descarga a través del puente. Si el servidor del audio lo rechaza (RNE, por ejemplo),
+// se intenta directamente desde este navegador, como al escuchar. Si tampoco se puede, se avisa.
+async function fetchAudioForDownload(ep, signal) {
+  try {
+    return await api('/audio?url=' + encodeURIComponent(ep.audio), { signal });
+  } catch (e) {
+    if (e.name === 'AbortError' || !/^Error (401|403|404|410|451)$/.test(e.message)) throw e;
+    try {
+      const r = await fetch(ep.audio, { signal, referrerPolicy: 'no-referrer' });
+      if (!r.ok) throw new Error('Error ' + r.status);
+      return r;
+    } catch (e2) {
+      if (e2.name === 'AbortError') throw e2;
+      throw new Error(`ese servidor no deja descargar el audio desde la app (${e.message.toLowerCase()}). Se puede escuchar en línea, pero no sin conexión`);
+    }
+  }
+}
 async function doDl(id) {
   const ep = findEp(id);
   const ctl = new AbortController();
   dlCtl[id] = ctl;
   try {
     if (!ep) throw new Error('Episodio no encontrado');
-    const r = await api('/audio?url=' + encodeURIComponent(ep.audio), { signal: ctl.signal });
+    const r = await fetchAudioForDownload(ep, ctl.signal);
     const total = +r.headers.get('Content-Length') || 0;
     const reader = r.body.getReader();
     const chunks = [];
@@ -510,7 +527,6 @@ async function loadEp(ep, autoplay) {
   saveCurrentPos();
   ready = false; triedProxy = false;
   cur = ep;
-  cfg.last = { id: ep.id, queue, qi }; saveCfg();
   if (objUrl) { URL.revokeObjectURL(objUrl); objUrl = null; }
   let src = ep.audio;
   if (downloaded.has(ep.id)) {
@@ -706,7 +722,7 @@ function epRow(ep, o = {}) {
     lead = `<button class="grip" data-grip="1" aria-label="Mantén pulsado y arrastra para cambiar el orden">${icon('grip')}</button>`;
     side = dlBtn(ep.id);
   } else if (!o.dl) {
-    side = `<button class="icon-btn" data-act="add-to-list" data-id="${ep.id}" aria-label="Añadir a una lista">${icon('plus')}</button>${dlBtn(ep.id)}`;
+    side = `<button class="icon-btn" data-act="add-to-list" data-id="${ep.id}" aria-label="Añadir a una lista">${icon('plus')}</button><button class="icon-btn" data-act="play-now" data-id="${ep.id}" aria-label="Reproducir">${icon('play')}</button>`;
   }
   const lst = o.list ? ` data-list="${o.list}" data-i="${o.i}" data-lp="1"` : ' data-lp="1"';
   const swipe = o.list ? ` data-swipe="item" data-list="${o.list}" data-epid="${ep.id}"` : '';
@@ -1050,6 +1066,7 @@ const actions = {
     closeSheet();
     if (l) playEp(id, l.items.slice(+el.dataset.i)); else playEp(id);
   },
+  'play-now': (el, id) => playEp(id),
   'ep-prev': () => prevEp(),
   'ep-next': () => nextEp(),
   'open-dl': () => go({ tab: 'settings', dl: true }),
@@ -1407,11 +1424,7 @@ async function boot() {
   await reconcileDownloads();
   history.replaceState(route, '');
   render();
-  if (cfg.last && findEp(cfg.last.id)) {
-    queue = cfg.last.queue || [cfg.last.id];
-    qi = cfg.last.qi || 0;
-    await loadEp(findEp(cfg.last.id), false);
-  }
+  if (cfg.last) { cfg.last = null; saveCfg(); }   // versiones anteriores guardaban el último episodio
   if (cfgOK()) { await sync(); refreshAll(false); }
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
   if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch((e) => console.warn(e));
