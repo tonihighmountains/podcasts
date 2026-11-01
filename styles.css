@@ -120,7 +120,7 @@ h1, h2, p { margin: 0; }
 .ep-side { display: flex; flex: none; }
 
 /* Listas */
-.cards { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.cards { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 3px; }
 .card { width: 100%; display: flex; flex-direction: column; gap: 0; padding: 8px 14px; border-radius: 12px; background: var(--surface); }
 .card:active { background: var(--surface2); }
 .card-title { font-size: 16px; font-weight: 650; line-height: 1.25; }
@@ -297,7 +297,7 @@ h1, h2, p { margin: 0; }
 .mini .play .ic { width: 26px; height: 26px; }
 
 /* Selección sin repintar: los avisos y acciones de la pantalla se ocultan por CSS */
-.page.selecting .list-actions, .page.selecting .hint-tip { display: none; }
+.page.selecting .list-actions { display: none; }
 .scrim { cursor: pointer; touch-action: manipulation; }
 /* Programas: tres botones por episodio (añadir, reproducir, descargar) */
 .eps:not(.compact) .ep-side .icon-btn { width: 40px; }
@@ -329,3 +329,17 @@ h1, h2, p { margin: 0; }
 .seg { display: flex; gap: 8px; }
 .seg button { flex: 1; min-height: 46px; padding: 0 8px; border-radius: 12px; background: var(--surface); border: 1px solid var(--line); font-weight: 600; text-align: center; }
 .seg button.on { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
+
+/* Programas: filas más bajas y estado («Escuchado» / «Va por…») junto a la fecha */
+.eps.tight .ep { padding: 6px 0; }
+.eps.tight .ep-main { min-height: 48px; gap: 11px; }
+.eps.tight .thumb { width: 46px; height: 46px; border-radius: 8px; }
+.eps.tight .thumb b { font-size: 15px; }
+.eps.tight .ep-title { font-size: 15px; line-height: 1.2; }
+.eps.tight .ep-meta { font-size: 12.5px; }
+.ep-state-inline { color: var(--accent-text); font-weight: 600; }
+
+/* Pulsación larga sobre una miniatura de programa */
+.show { -webkit-touch-callout: none; -webkit-user-select: none; user-select: none; transition: transform 0.35s ease, opacity 0.35s ease; }
+.show.pressing { transform: scale(0.95); opacity: 0.7; }
+.show .cover img { pointer-events: none; -webkit-user-drag: none; }

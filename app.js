@@ -3,7 +3,7 @@
 /* =====================================================================
    Utilidades
    ===================================================================== */
-const APP_VERSION = 'v13';
+const APP_VERSION = 'v14';
 const SKIP = 30;
 const RATES = [1, 1.25, 1.5, 1.75, 2];
 const $ = (s, el = document) => el.querySelector(s);
@@ -415,7 +415,6 @@ function addManyToList(listId, ids) {
   if (added) { l.mod = now(); touch(); }
   return { added, dup };
 }
-const inOtherLists = (id, exceptId) => visibleLists().some((l) => l.id !== exceptId && l.items.includes(id));
 const normTxt = (t) => (t || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
 function filterEps(eps, q) {
   const words = normTxt(q).split(/\s+/).filter(Boolean);
@@ -430,17 +429,18 @@ function moveList(from, to) {
   arr.forEach((l, i) => { if (l.order !== i) { l.order = i; l.mod = now(); } });
   touch();
 }
-function removeEverywhere(id) {
-  visibleLists().forEach((l) => { if (l.items.includes(id)) { l.items = l.items.filter((x) => x !== id); l.mod = now(); } });
+function removeEverywhere(ids) {
+  const set = new Set(Array.isArray(ids) ? ids : [ids]);
+  visibleLists().forEach((l) => {
+    if (l.items.some((x) => set.has(x))) { l.items = l.items.filter((x) => !set.has(x)); l.mod = now(); }
+  });
   touch();
 }
 function removeItemFromList(listId, epId) {
-  const l = state.playlists[listId];
-  if (!l || !l.items.includes(epId)) return;
-  l.items = l.items.filter((x) => x !== epId);
-  l.mod = now(); touch();
-  if (downloaded.has(epId) && !inOtherLists(epId, listId)) deleteDl(epId);
-  toast('Quitado: ' + short(findEp(epId)?.title, 34));
+  if (!visibleLists().some((l) => l.items.includes(epId))) return;
+  removeEverywhere(epId);
+  if (downloaded.has(epId)) deleteDl(epId);
+  toast('Quitado de todas las listas');
   render();
 }
 async function askDeleteList(id) {
@@ -792,7 +792,7 @@ function viewShows() {
   }
   const cards = shows.map((s) => {
     const last = feeds[s.id]?.episodes?.[0];
-    return `<button class="show" data-act="open-show" data-id="${s.id}">${cover(s.image, s.title, 'cover')}<span class="show-title">${esc(s.title)}</span><span class="show-sub">${last ? fmtDate(last.pub) : loading[s.id] ? 'Cargando…' : 'Sin cargar'}</span></button>`;
+    return `<button class="show" data-act="open-show" data-id="${s.id}" data-lp="1">${cover(s.image, s.title, 'cover')}<span class="show-title">${esc(s.title)}</span><span class="show-sub">${last ? fmtDate(last.pub) : loading[s.id] ? 'Cargando…' : 'Sin cargar'}</span></button>`;
   }).join('');
   return `<div class="page"><header class="top"><h1>Programas</h1><button class="icon-btn" data-act="refresh-all" aria-label="Actualizar todos">${icon('refresh')}</button></header><div class="grid">${cards}</div></div>`;
 }
@@ -816,7 +816,9 @@ function epRow(ep, o = {}) {
   const lst = o.list ? ` data-list="${o.list}" data-i="${o.i}" data-lp="1"` : ' data-lp="1"';
   const swipe = o.list ? ` data-swipe="item" data-list="${o.list}"` : '';
   const under = o.list ? `<div class="swipe-under" aria-hidden="true">${icon('trash')}</div>` : '';
-  return `<li class="ep${o.list ? ' swipe' : ''}${on ? ' on' : ''}${isSel ? ' sel' : ''}" data-epid="${ep.id}"${swipe}>${under}<div class="row">${lead}<button class="ep-main" data-act="open-ep" data-id="${ep.id}"${lst}>${epCover(ep)}<span class="ep-text"><span class="ep-title">${esc(ep.title)}</span><span class="ep-meta">${esc(meta)}</span>${stateTxt ? `<span class="ep-state">${stateTxt}</span>` : ''}${pct > 0 && !(p && p.done) ? `<span class="bar"><i style="width:${pct}%"></i></span>` : ''}</span></button>${side ? `<div class="ep-side">${side}</div>` : ''}</div></li>`;
+  const inline = !o.list && !o.dl;      // en Programas, «Escuchado» / «Va por…» va junto a la fecha
+  const metaHtml = esc(meta) + (inline && stateTxt ? `${meta ? ' - ' : ''}<span class="ep-state-inline">${stateTxt}</span>` : '');
+  return `<li class="ep${o.list ? ' swipe' : ''}${on ? ' on' : ''}${isSel ? ' sel' : ''}" data-epid="${ep.id}"${swipe}>${under}<div class="row">${lead}<button class="ep-main" data-act="open-ep" data-id="${ep.id}"${lst}>${epCover(ep)}<span class="ep-text"><span class="ep-title">${esc(ep.title)}</span><span class="ep-meta">${metaHtml}</span>${stateTxt && !inline ? `<span class="ep-state">${stateTxt}</span>` : ''}${pct > 0 && !(p && p.done) ? `<span class="bar"><i style="width:${pct}%"></i></span>` : ''}</span></button>${side ? `<div class="ep-side">${side}</div>` : ''}</div></li>`;
 }
 
 /* Barra superior mientras se selecciona (sin círculos: el episodio se ve en gris) */
@@ -825,7 +827,7 @@ function selBar(kind) {
   const btns = kind === 'list'
     ? b('sel-all', 'checkall', 'Seleccionar todos') + b('sel-add', 'plus', 'Añadir seleccionados a una lista') + b('sel-dl', 'down', 'Descargar seleccionados') + b('sel-remove', 'trash', 'Quitar seleccionados')
     : kind === 'show'
-      ? b('sel-all', 'checkall', 'Seleccionar todos los que se ven') + b('sel-add', 'plus', 'Añadir seleccionados a una lista') + b('sel-dl', 'down', 'Descargar seleccionados')
+      ? b('sel-add', 'plus', 'Añadir seleccionados a una lista') + b('sel-dl', 'down', 'Descargar seleccionados')
       : b('sel-all', 'checkall', 'Seleccionar todos') + b('sel-remove', 'trash', 'Borrar seleccionados');
   return `<header class="top sub sel-bar"><button class="icon-btn" data-act="sel-cancel" aria-label="Cancelar selección">${icon('close')}</button><b class="sel-count">${sel.size} seleccionado${sel.size === 1 ? '' : 's'}</b><div class="top-actions">${btns}</div></header>`;
 }
@@ -866,7 +868,7 @@ function showListHtml(s) {
   const more = matches.length > shown.length
     ? `<button class="btn wide" style="margin-top:12px" data-act="more-eps">Ver más episodios</button>` : '';
   const none = q && !matches.length ? '<p class="muted pad">Ningún episodio coincide. Prueba con menos palabras.</p>' : '';
-  return `${count}${none}<ul class="eps">${shown.map((e) => epRow(e, { sel: selecting })).join('')}</ul>${more}`;
+  return `${count}${none}<ul class="eps tight">${shown.map((e) => epRow(e, { sel: selecting })).join('')}</ul>${more}`;
 }
 function viewShow() {
   const s = state.shows[route.show];
@@ -875,7 +877,6 @@ function viewShow() {
   return `<div class="page${sel.size ? ' selecting' : ''}">${headHtml()}
   <div class="hero">${cover(s.image, s.title, 'cover lg')}<div><h1 class="hero-title">${esc(s.title)}</h1><p class="muted">${esc(s.author || '')}</p></div></div>
   ${hasEps ? `<input class="field" data-bind="epq" type="text" placeholder="Buscar en los episodios…" value="${esc(ui.epq || '')}" autocapitalize="off" autocorrect="off" spellcheck="false" enterkeyhint="search" aria-label="Buscar en los episodios">` : ''}
-  ${hasEps && !ui.epq ? '<p class="muted tip hint-tip">Toca un episodio para ver su descripción. Mantenlo pulsado para seleccionar varios.</p>' : ''}
   <div id="show-eps">${showListHtml(s)}</div></div>`;
 }
 function updateShowList() {
@@ -929,7 +930,6 @@ function viewSettings() {
   const hint = !standalone
     ? `<div class="hint">${isIOS ? 'Para instalarla: en Safari toca Compartir y después Añadir a pantalla de inicio.' : 'Para instalarla: en Chrome abre el menú y toca Instalar aplicación.'} Abre siempre la app desde el icono.</div>`
     : '';
-  const mine = visibleShows();
   const results = searchRes
     ? searchRes.length
       ? `<ul class="results">${searchRes.map((r, i) => {
@@ -948,8 +948,6 @@ function viewSettings() {
     <div class="inline"><input class="field" data-bind="q" placeholder="Más de uno, Espacio en blanco…" value="${esc(ui.q)}" aria-label="Buscar programa" enterkeyhint="search"><button class="btn primary" data-act="search" ${ui.searching ? 'disabled' : ''}>${ui.searching ? 'Buscando…' : 'Buscar'}</button></div>
     ${results}
     <div class="inline" style="margin-top:12px"><input class="field" data-bind="rss" placeholder="https://…/feed.xml" value="${esc(ui.rss)}" autocapitalize="off" autocorrect="off" spellcheck="false" inputmode="url" aria-label="Dirección RSS"><button class="btn" data-act="add-rss">Añadir</button></div></section>
-  <section class="sect"><h2>Mis programas</h2>
-    ${mine.length ? `<ul class="results" style="margin-top:6px">${mine.map((s) => `<li class="result">${cover(s.image, s.title, 'thumb')}<span class="ep-text"><span class="ep-title">${esc(s.title)}</span></span><button class="icon-btn" data-act="remove-show" data-id="${s.id}" aria-label="Quitar ${esc(s.title)}">${icon('trash')}</button></li>`).join('')}</ul>` : '<p>Todavía no hay ninguno.</p>'}</section>
   <section class="sect"><h2>Descargas</h2><div class="dl-line"><p id="storage-info"></p><button class="btn" data-act="open-dl">Ver episodios</button></div>
     <label class="switch"><span>Borrar la descarga al terminar un episodio</span><input type="checkbox" data-act="toggle-autodel" ${cfg.autoDelete ? 'checked' : ''}></label>
     <button class="btn danger wide" data-act="clear-dl" style="margin-top:8px">Borrar todas las descargas</button></section>
@@ -1184,6 +1182,7 @@ const actions = {
     closeSheet();
     if (l) playEp(id, l.items.slice(+el.dataset.i)); else playEp(id);
   },
+  'del-show': (el, id) => { closeSheet(); removeShow(id); render(); toast('Programa borrado'); },
   'panel-dl': (el, id) => { closeSheet(); enqueueDl(id); if (dlProg[id] !== undefined) toast('Descargando…'); },
   'cancel-dl-sheet': (el, id) => { cancelDl(id); closeSheet(); },
   'ep-prev': () => prevEp(),
@@ -1235,7 +1234,6 @@ const actions = {
     unfocus();
     let ids = [];
     if (route.dl) ids = downloadedIds();
-    else if (route.show) { const s = state.shows[route.show]; ids = s ? showEpsToShow(s).shown.map((e) => e.id) : []; }
     else { const l = state.playlists[route.list]; ids = l ? l.items.slice() : []; }
     if (ids.length && ids.every((x) => sel.has(x))) { exitSel(); return; }
     ids.forEach((x) => sel.add(x)); applySelUI();
@@ -1253,11 +1251,9 @@ const actions = {
         <button class="btn wide" data-act="close-sheet">Cancelar</button></div>`);
       return;
     }
-    const withDl = ids.filter((x) => downloaded.has(x) && !inOtherLists(x, route.list)).length;
-    const shared = ids.filter((x) => downloaded.has(x) && inOtherLists(x, route.list)).length;
-    const extra = withDl ? ` También se borrará ${withDl === 1 ? 'su descarga' : 'la descarga de ' + withDl}.` : '';
-    sheet(`<h2>Quitar ${n} episodio${n === 1 ? '' : 's'} de la lista</h2><p>Siguen disponibles en su programa.${extra}${shared ? ' Los que están también en otras listas conservan su descarga.' : ''}</p>
-      <div class="row-stack"><button class="btn danger wide" data-act="sel-remove-ok">Quitar de la lista</button>
+    const one = n === 1;
+    sheet(`<h2>Quitar ${n} episodio${one ? '' : 's'}</h2><p>${one ? 'Se quitará de todas las listas donde esté y se borrará su descarga. Sigue disponible en su programa.' : 'Se quitarán de todas las listas donde estén y se borrarán sus descargas. Siguen disponibles en su programa.'}</p>
+      <div class="row-stack"><button class="btn danger wide" data-act="sel-remove-ok">Quitar de todas las listas</button>
       <button class="btn wide" data-act="close-sheet">Cancelar</button></div>`);
   },
   'sel-remove-ok': () => removeSelected(),
@@ -1350,14 +1346,11 @@ function toggleSel(id) {
   if (!sel.size) exitSel(); else applySelUI();
 }
 function removeSelected() {
-  const l = state.playlists[route.list];
-  const ids = new Set(sel);
+  const ids = Array.from(sel);
   closeSheet();
-  if (!l) return;
-  l.items = l.items.filter((x) => !ids.has(x));
-  l.mod = now(); touch();
-  ids.forEach((x) => { if (downloaded.has(x) && !inOtherLists(x, l.id)) deleteDl(x); });
-  toast(`Quitado${ids.size === 1 ? '' : 's'} ${ids.size} episodio${ids.size === 1 ? '' : 's'}`);
+  removeEverywhere(ids);
+  ids.forEach((x) => { if (downloaded.has(x)) deleteDl(x); });
+  toast(`Quitado${ids.length === 1 ? '' : 's'} ${ids.length} episodio${ids.length === 1 ? '' : 's'} de todas las listas`);
   exitSel(); render();
 }
 async function deleteDownloads(ids, alsoFromLists) {
@@ -1368,6 +1361,14 @@ async function deleteDownloads(ids, alsoFromLists) {
   }
   toast(alsoFromLists ? `Borrado${ids.length === 1 ? '' : 's'} ${ids.length} episodio${ids.length === 1 ? '' : 's'} y su descarga` : `Borrada${ids.length === 1 ? '' : 's'} ${ids.length} descarga${ids.length === 1 ? '' : 's'}`);
   exitSel(); render();
+}
+function openShowMenu(id) {
+  const s = state.shows[id];
+  if (!s || s.del) return;
+  const n = (feeds[id]?.episodes || []).length;
+  sheet(`<div class="es-head">${cover(s.image, s.title, 'thumb')}<div class="es-text"><h2>${esc(s.title)}</h2><p>${n} episodio${n === 1 ? '' : 's'} guardado${n === 1 ? '' : 's'}</p></div></div>
+    <p class="small muted">Se quitará de Programas y se borrará su historial de episodios guardado. Los episodios que estén en listas o descargados se mantienen.</p>
+    <div class="row-stack"><button class="btn danger wide" data-act="del-show" data-id="${id}">Borrar programa</button><button class="btn wide" data-act="close-sheet">Cancelar</button></div>`);
 }
 function openEpSheet(id, listId, idx) {
   const ep = findEp(id);
@@ -1390,14 +1391,16 @@ let lp = null, lpFired = false;
 document.addEventListener('pointerdown', (e) => {
   lpFired = false;
   if (sel.size || drag) return;
-  const m = e.target.closest('.ep-main[data-lp]');
+  const m = e.target.closest('.ep-main[data-lp], .show[data-lp]');
   if (!m || (e.pointerType === 'mouse' && e.button !== 0)) return;
-  const li = m.closest('li');
+  const isShow = m.classList.contains('show');
+  const li = isShow ? m : m.closest('li');
   const id = m.dataset.id;
   const t = setTimeout(() => { li && li.classList.add('pressing'); }, 120);
   const t2 = setTimeout(() => {
     lp = null; lpFired = true;
-    enterSel(id);
+    if (li) li.classList.remove('pressing');
+    if (isShow) openShowMenu(id); else enterSel(id);
   }, 500);
   lp = { pid: e.pointerId, x: e.clientX, y: e.clientY, li, cancel: () => { clearTimeout(t); clearTimeout(t2); li && li.classList.remove('pressing'); } };
 });
@@ -1413,7 +1416,7 @@ document.addEventListener('pointerup', () => { if (lpFired) setTimeout(() => { l
 document.addEventListener('click', (e) => {
   if (lpFired) { lpFired = false; e.stopPropagation(); e.preventDefault(); }
 }, true);
-document.addEventListener('contextmenu', (e) => { if (e.target.closest('.ep-main, .grip')) e.preventDefault(); });
+document.addEventListener('contextmenu', (e) => { if (e.target.closest('.ep-main, .grip, .show')) e.preventDefault(); });
 
 /* ---------- Arrastrar para ordenar (rayas de la izquierda) ---------- */
 let drag = null;
