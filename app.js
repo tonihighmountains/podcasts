@@ -3,7 +3,7 @@
 /* =====================================================================
    Utilidades
    ===================================================================== */
-const APP_VERSION = 'v14';
+const APP_VERSION = 'v15';
 const SKIP = 30;
 const RATES = [1, 1.25, 1.5, 1.75, 2];
 const $ = (s, el = document) => el.querySelector(s);
@@ -246,10 +246,17 @@ function mergeState(a, b) {
   };
 }
 
-let syncTimer = null, syncing = false;
+let syncTimer = null, syncAt = 0, syncing = false, syncBackoff = 0;
 function touch() { saveState(); syncSoon(); }
+// Posición de reproducción: se guarda en el móvil enseguida, pero se sube a la nube de tarde en tarde
+// (el plan gratuito de Cloudflare permite 1.000 escrituras al día)
+function touchPos() { saveState(); syncSoon(5 * 60e3); }
 function syncSoon(ms = 30000) {
-  if (syncTimer || !cfgOK()) return;
+  if (!cfgOK()) return;
+  const due = now() + ms;
+  if (syncTimer && syncAt <= due) return;          // ya hay una subida programada igual de pronto o antes
+  clearTimeout(syncTimer);
+  syncAt = due;
   syncTimer = setTimeout(() => { syncTimer = null; sync(); }, ms);
 }
 function setSyncStatus(t) { const el = $('#sync-status'); if (el) el.textContent = t; }
@@ -259,6 +266,7 @@ function syncLabel() {
 async function sync(manual = false) {
   if (!cfgOK()) { if (manual) toast('Configura el servidor y la clave'); return false; }
   if (syncing) return false;
+  if (!manual && now() < syncBackoff) return false;
   if (!navigator.onLine) { if (manual) toast('Sin conexión'); return false; }
   syncing = true;
   setSyncStatus('Sincronizando…');
@@ -274,12 +282,19 @@ async function sync(manual = false) {
       await api('/sync', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(state) });
     }
     cfg.lastSync = now(); saveCfg();
+    syncBackoff = 0;
     setSyncStatus(syncLabel());
     if (manual) toast('Sincronizado');
     return true;
   } catch (e) {
-    setSyncStatus('No se pudo sincronizar: ' + e.message);
-    if (manual) toast(e.message);
+    if (/429|too many|l[ií]mite|limit/i.test(e.message)) {
+      syncBackoff = now() + 30 * 60e3;
+      setSyncStatus('Sincronización en pausa: se ha alcanzado el límite diario de Cloudflare. Se reintenta sola más tarde.');
+      if (manual) toast('Límite diario de Cloudflare alcanzado');
+    } else {
+      setSyncStatus('No se pudo sincronizar: ' + e.message);
+      if (manual) toast(e.message);
+    }
     return false;
   } finally { syncing = false; }
 }
@@ -624,7 +639,7 @@ function saveCurrentPos() {
   const done = d - t < 15 || t / d > 0.98;
   state.pos[cur.id] = { t: Math.floor(t), d: Math.floor(d), done, at: now() };
   lastSave = performance.now();
-  touch();
+  touchPos();
 }
 function skip(d) {
   if (!cur) return;
@@ -698,7 +713,7 @@ function onAudioError() {
   toast(navigator.onLine ? 'No se puede reproducir este episodio' : 'Sin conexión. Descarga el episodio para escucharlo sin red.');
 }
 A.addEventListener('play', () => { wantPlay = true; setPlaying(true); });
-A.addEventListener('pause', () => { setPlaying(false); saveCurrentPos(); render(); });
+A.addEventListener('pause', () => { setPlaying(false); saveCurrentPos(); syncSoon(3000); render(); });
 A.addEventListener('timeupdate', onTime);
 A.addEventListener('ended', onEnded);
 A.addEventListener('error', onAudioError);
@@ -1564,7 +1579,7 @@ document.addEventListener('keydown', (e) => {
   else if (t.dataset?.bind === 'rss') { e.preventDefault(); addRss(); }
 });
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'hidden') { saveCurrentPos(); }
+  if (document.visibilityState === 'hidden') { saveCurrentPos(); syncSoon(1500); }
   else { checkAudioSession(); if (cfgOK()) sync(); }
 });
 window.addEventListener('online', () => { if (cfgOK()) sync(); });
