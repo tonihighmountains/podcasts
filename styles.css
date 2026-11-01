@@ -301,3 +301,31 @@ h1, h2, p { margin: 0; }
 .scrim { cursor: pointer; touch-action: manipulation; }
 /* Programas: tres botones por episodio (añadir, reproducir, descargar) */
 .eps:not(.compact) .ep-side .icon-btn { width: 40px; }
+
+/* Ficha del episodio con acciones */
+.acts { display: flex; gap: 10px; margin-top: 14px; }
+.act { flex: 1; min-width: 0; min-height: 68px; padding: 8px 4px; border-radius: 14px; background: var(--surface2); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; font-size: 12.5px; font-weight: 650; text-align: center; line-height: 1.15; }
+.act:active { opacity: 0.8; }
+.act.primary { background: var(--accent); color: var(--on-accent); }
+.act .ic { width: 24px; height: 24px; }
+
+/* Selector de listas: casillas redondas, varias a la vez */
+.picks { list-style: none; margin: 0 0 4px; padding: 0; }
+.pick { width: 100%; min-height: 52px; display: flex; align-items: center; gap: 12px; text-align: left; font-weight: 600; border-top: 1px solid var(--line); }
+.pick .ic { color: var(--muted); flex: none; }
+.pick.on .ic { color: var(--accent); }
+.pick:disabled { opacity: 0.55; cursor: default; }
+.pick-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pick-tag { color: var(--muted); font-weight: 400; font-size: 13px; flex: none; }
+.pick.new { border-bottom: 1px solid var(--line); margin-bottom: 4px; }
+
+/* Marca de descargado en las listas */
+.dl-mark { flex: none; display: inline-flex; align-items: center; justify-content: center; color: var(--ok); font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.dl-mark.done { width: 30px; height: 30px; }
+.dl-mark.done .ic { width: 21px; height: 21px; }
+.dl-mark.busy { color: var(--accent-text); padding: 0 8px; }
+
+/* Selector de dos opciones */
+.seg { display: flex; gap: 8px; }
+.seg button { flex: 1; min-height: 46px; padding: 0 8px; border-radius: 12px; background: var(--surface); border: 1px solid var(--line); font-weight: 600; text-align: center; }
+.seg button.on { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }

@@ -3,7 +3,7 @@
 /* =====================================================================
    Utilidades
    ===================================================================== */
-const APP_VERSION = 'v12';
+const APP_VERSION = 'v13';
 const SKIP = 30;
 const RATES = [1, 1.25, 1.5, 1.75, 2];
 const $ = (s, el = document) => el.querySelector(s);
@@ -80,7 +80,7 @@ const jset = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } cat
 // Estado que se sincroniza entre dispositivos
 let state = Object.assign({ shows: {}, playlists: {}, episodes: {}, pos: {} }, jget(LS.state, {}));
 // Configuración de este dispositivo
-let cfg = Object.assign({ worker: '', key: '', rate: 1, autoDelete: false, lastSync: 0, last: null }, jget(LS.cfg, {}));
+let cfg = Object.assign({ worker: '', key: '', rate: 1, autoDelete: false, lastSync: 0, last: null, trackKeys: 'skip' }, jget(LS.cfg, {}));
 let feeds = {};                          // showId -> { at, episodes: [] } (se guarda en IndexedDB)
 let dlMeta = jget(LS.dl, {});            // epId -> { size, at }
 let downloaded = new Set();              // epId descargados en este dispositivo (IndexedDB)
@@ -403,8 +403,8 @@ function addToList(listId, epId) {
 }
 function addManyToList(listId, ids) {
   const l = state.playlists[listId];
-  if (!l) return;
   let added = 0, dup = 0;
+  if (!l) return { added, dup };
   ids.forEach((id) => {
     const ep = findEp(id);
     if (!ep) return;
@@ -413,9 +413,7 @@ function addManyToList(listId, ids) {
     l.items.push(id); added++;
   });
   if (added) { l.mod = now(); touch(); }
-  const nm = short(l.name, 24);
-  if (!added) toast(ids.length === 1 ? 'Ya está en esa lista' : 'Ya estaban todos en esa lista');
-  else toast(`Añadido${added === 1 ? '' : 's'} ${added} a ${nm}${dup ? ` (${dup} ya estaba${dup === 1 ? '' : 'n'})` : ''}`);
+  return { added, dup };
 }
 const inOtherLists = (id, exceptId) => visibleLists().some((l) => l.id !== exceptId && l.items.includes(id));
 const normTxt = (t) => (t || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
@@ -556,9 +554,15 @@ function dlBtn(id) {
   if (downloaded.has(id)) return `<button class="icon-btn dl done" ${a} data-act="del-dl" data-id="${id}" aria-label="Descargado. Tocar para borrar">${icon('check')}</button>`;
   return `<button class="icon-btn dl" ${a} data-act="dl" data-id="${id}" aria-label="Descargar">${icon('down')}</button>`;
 }
+function dlMark(id) {
+  const a = `data-dl-id="${id}" data-dl-kind="mark"`;
+  if (dlProg[id] !== undefined) { const p = dlProg[id]; return `<span class="dl-mark busy" ${a}>${p >= 0 ? Math.round(p * 100) + '%' : '…'}</span>`; }
+  if (downloaded.has(id)) return `<span class="dl-mark done" ${a} role="img" aria-label="Descargado">${icon('check')}</span>`;
+  return `<span class="dl-mark" ${a}></span>`;
+}
 function refreshDl(id) {
   const v = $('#view'); if (v) v._html = null;
-  document.querySelectorAll(`[data-dl-id="${CSS.escape(id)}"]`).forEach((el) => { el.outerHTML = dlBtn(id); });
+  document.querySelectorAll(`[data-dl-id="${CSS.escape(id)}"]`).forEach((el) => { el.outerHTML = el.dataset.dlKind === 'mark' ? dlMark(id) : dlBtn(id); });
 }
 function storageUsed() { return Object.values(dlMeta).reduce((a, m) => a + (m.size || 0), 0); }
 function refreshStorageInfo() {
@@ -606,6 +610,7 @@ async function loadEp(ep, autoplay) {
   A.playbackRate = cfg.rate;
   setMedia(ep);
   renderMini(); renderPlayer(); markPlaying();
+  wantPlay = !!autoplay;
   if (autoplay) { try { await A.play(); } catch (e) { console.warn(e); } }
 }
 function markPlaying() {
@@ -626,9 +631,11 @@ function skip(d) {
   const dur = isFinite(A.duration) ? A.duration : 1e9;
   A.currentTime = Math.min(dur, Math.max(0, A.currentTime + d));
 }
+let wantPlay = false;          // el usuario quiere que suene (pasa a false al pausar a propósito)
 function togglePlay() {
   if (!cur) return;
-  if (A.paused) A.play().catch((e) => console.warn(e)); else A.pause();
+  if (A.paused) { wantPlay = true; A.play().catch((e) => console.warn(e)); }
+  else { wantPlay = false; A.pause(); }
 }
 function setPlaying(on) {
   $('#mini [data-act="toggle-play"]') && ($('#mini [data-act="toggle-play"]').innerHTML = icon(on ? 'pause' : 'play'));
@@ -667,6 +674,7 @@ function onEnded() {
     const next = findEp(queue[qi]);
     if (next) loadEp(next, true);
   } else {
+    wantPlay = false;
     setPlaying(false);
     render();
   }
@@ -689,7 +697,7 @@ function onAudioError() {
   }
   toast(navigator.onLine ? 'No se puede reproducir este episodio' : 'Sin conexión. Descarga el episodio para escucharlo sin red.');
 }
-A.addEventListener('play', () => setPlaying(true));
+A.addEventListener('play', () => { wantPlay = true; setPlaying(true); });
 A.addEventListener('pause', () => { setPlaying(false); saveCurrentPos(); render(); });
 A.addEventListener('timeupdate', onTime);
 A.addEventListener('ended', onEnded);
@@ -708,22 +716,41 @@ function setMedia(ep) {
 (function mediaKeys() {
   if (!('mediaSession' in navigator)) return;
   const h = (a, f) => { try { navigator.mediaSession.setActionHandler(a, f); } catch {} };
-  h('play', () => A.play());
-  h('pause', () => A.pause());
+  h('play', () => { wantPlay = true; A.play().catch(() => {}); });
+  h('pause', () => { wantPlay = false; A.pause(); });
   h('seekbackward', () => skip(-SKIP));
   h('seekforward', () => skip(SKIP));
-  // AirPods: doble pulsación = siguiente, triple = anterior. Aquí se convierten en +30 s y -30 s
-  h('nexttrack', () => skip(SKIP));
-  h('previoustrack', () => skip(-SKIP));
+  // «Siguiente» y «anterior» (doble y triple pulsación de los AirPods, Siri, botones de la pantalla de bloqueo):
+  // según el ajuste, saltan 30 s o cambian de episodio
+  h('nexttrack', () => { if (cfg.trackKeys === 'episode') nextEp(); else skip(SKIP); });
+  h('previoustrack', () => { if (cfg.trackKeys === 'episode') prevEp(); else skip(-SKIP); });
   h('seekto', (d) => { if (d.seekTime != null) A.currentTime = d.seekTime; });
 })();
 
+/* Llamadas y otras interrupciones del audio: al terminar, se reanuda si estaba sonando */
+let wasInterrupted = false;
+function resumeAfterInterruption() {
+  let tries = 0;
+  const go = () => {
+    if (!wantPlay || !cur || !A.paused || ++tries > 15) return;
+    A.play().catch(() => setTimeout(go, 1000));
+  };
+  setTimeout(go, 300);
+}
+function checkAudioSession() {
+  const st = navigator.audioSession && navigator.audioSession.state;
+  if (st === 'interrupted') { wasInterrupted = true; return; }
+  if (wasInterrupted) { wasInterrupted = false; if (wantPlay) resumeAfterInterruption(); }
+}
+if (navigator.audioSession) {
+  try { navigator.audioSession.type = 'playback'; } catch {}
+  navigator.audioSession.addEventListener('statechange', checkAudioSession);
+}
+
 function prevEp() {
   if (!cur) return;
-  if (A.currentTime > 5 || qi <= 0) { A.currentTime = 0; return; }
-  qi--;
-  const e = findEp(queue[qi]);
-  if (e) loadEp(e, true);
+  if (qi > 0) { qi--; const e = findEp(queue[qi]); if (e) { loadEp(e, true); return; } }
+  A.currentTime = 0;
 }
 function nextEp() {
   if (!cur) return;
@@ -784,23 +811,21 @@ function epRow(ep, o = {}) {
   let lead = '', side = '';
   if (o.list) {
     lead = `<button class="grip" data-grip="1" aria-label="Mantén pulsado y arrastra para cambiar el orden">${icon('grip')}</button>`;
-    side = dlBtn(ep.id);
-  } else if (!o.dl) {
-    side = `<button class="icon-btn" data-act="add-to-list" data-id="${ep.id}" aria-label="Añadir a una lista">${icon('plus')}</button><button class="icon-btn" data-act="play-now" data-id="${ep.id}" aria-label="Reproducir">${icon('play')}</button>${dlBtn(ep.id)}`;
+    side = dlMark(ep.id);
   }
   const lst = o.list ? ` data-list="${o.list}" data-i="${o.i}" data-lp="1"` : ' data-lp="1"';
   const swipe = o.list ? ` data-swipe="item" data-list="${o.list}"` : '';
   const under = o.list ? `<div class="swipe-under" aria-hidden="true">${icon('trash')}</div>` : '';
-  return `<li class="ep${o.list ? ' swipe' : ''}${on ? ' on' : ''}${isSel ? ' sel' : ''}" data-epid="${ep.id}"${swipe}>${under}<div class="row">${lead}<button class="ep-main" data-act="open-ep" data-id="${ep.id}"${lst}>${epCover(ep)}<span class="ep-text"><span class="ep-title">${esc(ep.title)}</span><span class="ep-meta">${esc(meta)}</span>${stateTxt ? `<span class="ep-state">${stateTxt}</span>` : ''}${pct > 0 && !(p && p.done) ? `<span class="bar"><i style="width:${pct}%"></i></span>` : ''}</span></button><div class="ep-side">${side}</div></div></li>`;
+  return `<li class="ep${o.list ? ' swipe' : ''}${on ? ' on' : ''}${isSel ? ' sel' : ''}" data-epid="${ep.id}"${swipe}>${under}<div class="row">${lead}<button class="ep-main" data-act="open-ep" data-id="${ep.id}"${lst}>${epCover(ep)}<span class="ep-text"><span class="ep-title">${esc(ep.title)}</span><span class="ep-meta">${esc(meta)}</span>${stateTxt ? `<span class="ep-state">${stateTxt}</span>` : ''}${pct > 0 && !(p && p.done) ? `<span class="bar"><i style="width:${pct}%"></i></span>` : ''}</span></button>${side ? `<div class="ep-side">${side}</div>` : ''}</div></li>`;
 }
 
 /* Barra superior mientras se selecciona (sin círculos: el episodio se ve en gris) */
 function selBar(kind) {
   const b = (act, ic, label) => `<button class="icon-btn" data-act="${act}" aria-label="${label}">${icon(ic)}</button>`;
   const btns = kind === 'list'
-    ? b('sel-all', 'checkall', 'Seleccionar todos') + b('sel-dl', 'down', 'Descargar seleccionados') + b('sel-remove', 'trash', 'Quitar seleccionados')
+    ? b('sel-all', 'checkall', 'Seleccionar todos') + b('sel-add', 'plus', 'Añadir seleccionados a una lista') + b('sel-dl', 'down', 'Descargar seleccionados') + b('sel-remove', 'trash', 'Quitar seleccionados')
     : kind === 'show'
-      ? b('sel-all', 'checkall', 'Seleccionar todos los que se ven') + b('sel-dl', 'down', 'Descargar seleccionados') + b('sel-add', 'plus', 'Añadir seleccionados a una lista')
+      ? b('sel-all', 'checkall', 'Seleccionar todos los que se ven') + b('sel-add', 'plus', 'Añadir seleccionados a una lista') + b('sel-dl', 'down', 'Descargar seleccionados')
       : b('sel-all', 'checkall', 'Seleccionar todos') + b('sel-remove', 'trash', 'Borrar seleccionados');
   return `<header class="top sub sel-bar"><button class="icon-btn" data-act="sel-cancel" aria-label="Cancelar selección">${icon('close')}</button><b class="sel-count">${sel.size} seleccionado${sel.size === 1 ? '' : 's'}</b><div class="top-actions">${btns}</div></header>`;
 }
@@ -928,6 +953,8 @@ function viewSettings() {
   <section class="sect"><h2>Descargas</h2><div class="dl-line"><p id="storage-info"></p><button class="btn" data-act="open-dl">Ver episodios</button></div>
     <label class="switch"><span>Borrar la descarga al terminar un episodio</span><input type="checkbox" data-act="toggle-autodel" ${cfg.autoDelete ? 'checked' : ''}></label>
     <button class="btn danger wide" data-act="clear-dl" style="margin-top:8px">Borrar todas las descargas</button></section>
+  <section class="sect"><h2>AirPods y Siri</h2><p>Qué hacen «siguiente» y «anterior»: doble y triple pulsación de los AirPods, «oye Siri, pista siguiente» y los botones de la pantalla de bloqueo.</p>
+    <div class="seg" role="group"><button class="${cfg.trackKeys !== 'episode' ? 'on' : ''}" data-act="track-mode" data-mode="skip" aria-pressed="${cfg.trackKeys !== 'episode'}">Saltar 30 s</button><button class="${cfg.trackKeys === 'episode' ? 'on' : ''}" data-act="track-mode" data-mode="episode" aria-pressed="${cfg.trackKeys === 'episode'}">Cambiar de episodio</button></div></section>
   <section class="sect"><h2>Aplicación</h2><div class="dl-line"><p>Versión ${APP_VERSION}</p><button class="btn" data-act="update-app">Actualizar la app</button></div>
     <p class="status">Borra la copia guardada de la app y la vuelve a cargar. No toca tus descargas, listas ni programas.</p></section>
   ${hint}</div>`;
@@ -1059,17 +1086,25 @@ function confirmBox(title, text, ok, danger = false) {
     askRes = res;
   });
 }
-let pendingIds = [], pendingSel = false;
+let pendingIds = [], pendingSel = false, pendingLists = new Set();
 function pickListSheet(ids, fromSel = false) {
-  pendingIds = ids; pendingSel = fromSel;
-  const ls = visibleLists();
-  const n = ids.length;
+  pendingIds = ids; pendingSel = fromSel; pendingLists = new Set();
+  renderPick();
+}
+function renderPick() {
+  const ids = pendingIds, n = ids.length, ls = visibleLists();
   const rows = ls.map((l) => {
     const has = ids.filter((id) => l.items.includes(id)).length;
-    const tag = !has ? String(l.items.length) : n === 1 ? 'ya está' : `${has} de ${n} ya están`;
-    return `<li><button data-act="add-to" data-list="${l.id}">${esc(l.name)}<span>${tag}</span></button></li>`;
+    const all = has === n;
+    const on = all || pendingLists.has(l.id);
+    const tag = all ? (n === 1 ? 'ya está' : 'ya están') : has ? `${has} de ${n} ya están` : String(l.items.length);
+    return `<li><button class="pick${on ? ' on' : ''}" data-act="pick-toggle" data-list="${l.id}" aria-pressed="${on}" ${all ? 'disabled' : ''}>${icon(on ? 'checkfill' : 'circle')}<span class="pick-name">${esc(l.name)}</span><span class="pick-tag">${tag}</span></button></li>`;
   }).join('');
-  sheet(`<h2>${n > 1 ? `Añadir ${n} episodios a una lista` : 'Añadir a una lista'}</h2>${ls.length ? `<ul class="sheet-list">${rows}</ul>` : ''}<button class="btn wide" data-act="new-list-add">${icon('plus')} Nueva lista</button>`);
+  const k = pendingLists.size;
+  sheet(`<h2>${n > 1 ? `Añadir ${n} episodios a…` : 'Añadir a…'}</h2>
+    ${ls.length ? `<ul class="picks">${rows}</ul>` : '<p>Todavía no tienes listas.</p>'}
+    <button class="pick new" data-act="pick-new">${icon('plus')}<span class="pick-name">Nueva lista</span></button>
+    <div class="row-stack"><button class="btn primary wide" data-act="pick-apply" ${k ? '' : 'disabled'}>${k ? `Añadir a ${k} lista${k === 1 ? '' : 's'}` : 'Elige una o más listas'}</button></div>`);
 }
 let toastT;
 function toast(msg) {
@@ -1144,15 +1179,21 @@ const actions = {
     if (sel.size) { toggleSel(id); return; }
     openEpSheet(id, el.dataset.list, el.dataset.i);
   },
-  'play-sheet': (el, id) => {
+  'panel-play': (el, id) => {
     const l = el.dataset.list && state.playlists[el.dataset.list];
     closeSheet();
     if (l) playEp(id, l.items.slice(+el.dataset.i)); else playEp(id);
   },
-  'play-now': (el, id) => playEp(id),
+  'panel-dl': (el, id) => { closeSheet(); enqueueDl(id); if (dlProg[id] !== undefined) toast('Descargando…'); },
+  'cancel-dl-sheet': (el, id) => { cancelDl(id); closeSheet(); },
   'ep-prev': () => prevEp(),
   'ep-next': () => nextEp(),
   'open-dl': () => go({ tab: 'settings', dl: true }),
+  'track-mode': (el) => {
+    cfg.trackKeys = el.dataset.mode; saveCfg();
+    el.parentElement.querySelectorAll('button').forEach((b) => { const on = b === el; b.classList.toggle('on', on); b.setAttribute('aria-pressed', String(on)); });
+    $('#view')._html = null;
+  },
   'update-app': async () => {
     toast('Actualizando la app…');
     try {
@@ -1162,16 +1203,25 @@ const actions = {
     setTimeout(() => location.reload(), 500);
   },
   'add-to-list': (el, id) => pickListSheet([id]),
-  'add-to': (el) => {
-    const ids = pendingIds.slice(), fromSel = pendingSel;
-    closeSheet(); addManyToList(el.dataset.list, ids);
-    if (fromSel) exitSel(); else render();
+  'pick-toggle': (el) => {
+    const id = el.dataset.list;
+    if (pendingLists.has(id)) pendingLists.delete(id); else pendingLists.add(id);
+    renderPick();
   },
-  'new-list-add': async () => {
-    const ids = pendingIds.slice(), fromSel = pendingSel;
+  'pick-new': async () => {
     const name = await askText('Nombre de la lista', '', 'Crear');
-    if (!name) return;
-    const lid = newList(name); addManyToList(lid, ids);
+    if (name) pendingLists.add(newList(name));
+    renderPick();
+  },
+  'pick-apply': () => {
+    const ids = pendingIds.slice(), lists = Array.from(pendingLists), fromSel = pendingSel;
+    closeSheet();
+    let added = 0;
+    lists.forEach((lid) => { added += addManyToList(lid, ids).added; });
+    const k = lists.length;
+    if (!added) toast(ids.length === 1 ? 'Ya estaba en esas listas' : 'Ya estaban en esas listas');
+    else if (k === 1) toast(`Añadido${added === 1 ? '' : 's'} ${added} a ${short(state.playlists[lists[0]].name, 24)}`);
+    else toast(`Añadido a ${k} listas`);
     if (fromSel) exitSel(); else render();
   },
   'new-list': async () => {
@@ -1327,7 +1377,12 @@ function openEpSheet(id, listId, idx) {
   const desc = ep.desc ? esc(ep.desc).replace(/\n/g, '<br>') : '<span class="muted">Este episodio no tiene descripción.</span>';
   const gone = ep.gone && !downloaded.has(id) ? '<p class="muted small">Este episodio ya no está en el RSS del programa: puede que no se pueda reproducir.</p>' : '';
   const ctx = listId ? ` data-list="${listId}" data-i="${idx}"` : '';
-  sheet(`<div class="es-head">${epCover(ep, 'thumb')}<div class="es-text"><h2>${esc(ep.title)}</h2><p>${esc(meta)}</p></div><button class="icon-btn es-play" data-act="play-sheet" data-id="${id}"${ctx} aria-label="Reproducir">${icon('play')}</button></div><div class="desc">${desc}</div>${gone}`);
+  const act = (a, ic, label, extra = '') => `<button class="act${extra}" data-act="${a}" data-id="${id}"${a === 'panel-play' ? ctx : ''}>${icon(ic)}<span>${label}</span></button>`;
+  const dlAct = dlProg[id] !== undefined ? act('cancel-dl-sheet', 'close', 'Cancelar descarga')
+    : downloaded.has(id) ? act('del-dl', 'check', 'Borrar descarga') : act('panel-dl', 'down', 'Descargar');
+  sheet(`<div class="es-head">${epCover(ep, 'thumb')}<div class="es-text"><h2>${esc(ep.title)}</h2><p>${esc(meta)}</p></div></div>
+    <div class="acts">${act('add-to-list', 'plus', 'Añadir a lista')}${act('panel-play', 'play', 'Reproducir', ' primary')}${dlAct}</div>
+    <div class="desc">${desc}</div>${gone}`);
 }
 
 /* Pulsación larga (1 s) sobre un episodio de una lista: empieza la selección */
@@ -1507,7 +1562,7 @@ document.addEventListener('keydown', (e) => {
 });
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden') { saveCurrentPos(); }
-  else if (cfgOK()) sync();
+  else { checkAudioSession(); if (cfgOK()) sync(); }
 });
 window.addEventListener('online', () => { if (cfgOK()) sync(); });
 
