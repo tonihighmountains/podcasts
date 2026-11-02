@@ -3,7 +3,7 @@
 /* =====================================================================
    Utilidades
    ===================================================================== */
-const APP_VERSION = 'v15';
+const APP_VERSION = 'v16';
 const SKIP = 30;
 const RATES = [1, 1.25, 1.5, 1.75, 2];
 const $ = (s, el = document) => el.querySelector(s);
@@ -601,21 +601,52 @@ async function playEp(id, q) {
   qi = Math.max(0, queue.indexOf(id));
   await loadEp(ep, true);
 }
+let preload = null;                       // { id, url }: el siguiente episodio descargado, ya leído de la memoria
+let handingOff = false, lastDurChange = 0;
+async function preloadNext() {
+  const nid = queue[qi + 1];
+  if (!nid || !downloaded.has(nid) || (preload && preload.id === nid)) return;
+  try {
+    const rec = await idbGet(nid);
+    if (rec && rec.blob && queue[qi + 1] === nid) {
+      if (preload) URL.revokeObjectURL(preload.url);
+      preload = { id: nid, url: URL.createObjectURL(rec.blob) };
+    }
+  } catch (e) { console.warn(e); }
+}
+async function playWithRetry() {
+  for (let i = 0; i < 3; i++) {
+    try { await A.play(); return true; }
+    catch (e) {
+      console.warn(e);
+      if (e && e.name === 'NotAllowedError') break;           // el sistema exige tocar play: no se puede forzar
+      await new Promise((r) => setTimeout(r, 400));
+    }
+  }
+  setPlaying(false);
+  if (document.visibilityState === 'visible') toast('Pulsa play para continuar');
+  return false;
+}
 async function loadEp(ep, autoplay) {
   saveCurrentPos();
   ready = false; triedProxy = false;
   cur = ep;
   if (objUrl) { URL.revokeObjectURL(objUrl); objUrl = null; }
+  if (preload && preload.id !== ep.id) { URL.revokeObjectURL(preload.url); preload = null; }
   let src = ep.audio;
   if (downloaded.has(ep.id)) {
-    try {
-      const rec = await idbGet(ep.id);
-      if (rec && rec.blob) { objUrl = URL.createObjectURL(rec.blob); src = objUrl; }
-    } catch (e) { console.warn(e); }
+    if (preload && preload.id === ep.id) { objUrl = preload.url; src = objUrl; preload = null; }   // sin esperar a la memoria
+    else {
+      try {
+        const rec = await idbGet(ep.id);
+        if (rec && rec.blob) { objUrl = URL.createObjectURL(rec.blob); src = objUrl; }
+      } catch (e) { console.warn(e); }
+    }
   }
   const p = state.pos[ep.id];
   startAt = p && !p.done && p.t > 5 ? p.t : 0;
   A.src = src;
+  handingOff = false;
   A.addEventListener('loadedmetadata', () => {
     ready = true;
     A.playbackRate = cfg.rate;
@@ -626,7 +657,8 @@ async function loadEp(ep, autoplay) {
   setMedia(ep);
   renderMini(); renderPlayer(); markPlaying();
   wantPlay = !!autoplay;
-  if (autoplay) { try { await A.play(); } catch (e) { console.warn(e); } }
+  if (autoplay) await playWithRetry();
+  preloadNext();
 }
 function markPlaying() {
   const v = $('#view');
@@ -662,7 +694,17 @@ function onTime() {
   const d = A.duration || cur.dur || 0, t = A.currentTime;
   const pct = d ? Math.min(100, (t / d) * 100) : 0;
   const mb = $('#mini-bar'); if (mb) mb.style.width = pct + '%';
+  const mc = $('#mini-cur'), md = $('#mini-dur');
+  if (mc) { const a = fmtTime(t); if (mc.textContent !== a) mc.textContent = a; }
+  if (md) { const b = isFinite(d) ? fmtTime(d) : '0:00'; if (md.textContent !== b) md.textContent = b; }
   if (!scrubbing) updateScrubUI(t, d);
+  // Con el móvil bloqueado el aviso de «ha terminado» puede llegar tarde o no llegar: el relevo se hace
+  // medio segundo antes del final, cuando el audio sigue sonando y el sistema deja cambiar de episodio.
+  if (!A.paused && !handingOff && qi + 1 < queue.length && isFinite(A.duration) && A.duration > 60) {
+    const rem = A.duration - t;
+    const fiable = cur.dur ? Math.abs(A.duration - cur.dur) <= Math.max(20, cur.dur * 0.04) : performance.now() - lastDurChange > 10000;
+    if (fiable && rem > 0 && rem < 0.7) { advanceQueue(); return; }
+  }
   if (performance.now() - lastSave > 5000) saveCurrentPos();
   if (performance.now() - lastPosState > 1000 && 'mediaSession' in navigator && d && isFinite(d)) {
     lastPosState = performance.now();
@@ -678,8 +720,9 @@ function updateScrubUI(t, d) {
   c.textContent = fmtTime(t);
   l.textContent = d ? '/ ' + fmtTime(d) : '';
 }
-function onEnded() {
-  if (!cur) return;
+function advanceQueue() {
+  if (!cur || handingOff) return;
+  handingOff = true;
   state.pos[cur.id] = { t: Math.floor(A.duration || 0), d: Math.floor(A.duration || 0), done: true, at: now() };
   touch();
   const finished = cur.id;
@@ -687,13 +730,14 @@ function onEnded() {
   if (qi + 1 < queue.length) {
     qi++;
     const next = findEp(queue[qi]);
-    if (next) loadEp(next, true);
-  } else {
-    wantPlay = false;
-    setPlaying(false);
-    render();
+    if (next) { loadEp(next, true); return; }
   }
+  handingOff = false;
+  wantPlay = false;
+  setPlaying(false);
+  render();
 }
+function onEnded() { advanceQueue(); }
 function onAudioError() {
   if (!cur) return;
   if (objUrl && A.src === objUrl) {
@@ -717,7 +761,7 @@ A.addEventListener('pause', () => { setPlaying(false); saveCurrentPos(); syncSoo
 A.addEventListener('timeupdate', onTime);
 A.addEventListener('ended', onEnded);
 A.addEventListener('error', onAudioError);
-A.addEventListener('durationchange', () => { if (ready) onTime(); });
+A.addEventListener('durationchange', () => { lastDurChange = performance.now(); if (ready) onTime(); });
 
 function setMedia(ep) {
   if (!('mediaSession' in navigator)) return;
@@ -1016,7 +1060,7 @@ function renderMiniHtml(m) {
     <button class="icon-btn play" data-act="toggle-play" aria-label="Reproducir o pausar">${icon(A.paused ? 'play' : 'pause')}</button>
     <button class="icon-btn pn" data-act="ep-next" aria-label="Episodio siguiente">${icon('next')}</button>
     <button class="icon-btn skip" data-act="skip" data-d="${SKIP}" aria-label="Adelantar ${SKIP} segundos">${icon('fwd')}</button>
-    <div class="mini-bar"><i id="mini-bar"></i></div>`;
+    <div class="mini-prog"><div class="mini-bar"><i id="mini-bar"></i></div><span class="mini-time"><span id="mini-cur">0:00</span> / <span id="mini-dur">${fmtTime(cur.dur || 0)}</span></span></div>`;
 }
 function renderPlayer() {
   const p = $('#player');
