@@ -74,7 +74,6 @@ h1, h2, p { margin: 0; }
 .btn.wide { width: 100%; }
 .row-btns { display: flex; gap: 10px; margin-top: 14px; }
 .row-btns .btn { flex: 1; }
-.text-btn { color: var(--accent-text); font-weight: 600; min-height: 44px; padding: 0 8px; }
 
 /* Descarga */
 .dl { color: var(--muted); }
@@ -217,10 +216,8 @@ h1, h2, p { margin: 0; }
 
 /* Lista: asas para ordenar, selección y arrastre */
 .tip { font-size: 13px; margin: -4px 0 8px; }
-.grip, .chk { width: 40px; height: 56px; display: grid; place-items: center; flex: none; color: var(--muted); }
+.grip { width: 40px; height: 56px; display: grid; place-items: center; flex: none; color: var(--muted); }
 .grip { touch-action: none; cursor: grab; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
-.chk { color: var(--muted); }
-.chk.on { color: var(--accent-text); }
 .ep-main, .ep-main * { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
 .ep-main .thumb img { pointer-events: none; -webkit-user-drag: none; }
 .ep.sel { background: var(--sel); }
@@ -241,10 +238,9 @@ h1, h2, p { margin: 0; }
 .eps.compact .ep-title { font-size: 14px; line-height: 1.2; }
 .eps.compact .ep-meta, .eps.compact .ep-state { font-size: 11.5px; line-height: 1.25; }
 .eps.compact .bar { margin-top: 2px; }
-.eps.compact .grip, .eps.compact .chk { width: 34px; height: 44px; }
+.eps.compact .grip { width: 34px; height: 44px; }
 .eps.compact .icon-btn { width: 38px; height: 44px; }
 .eps.compact .ic { width: 22px; height: 22px; }
-.eps .chk { width: 40px; height: 56px; }
 
 /* Deslizar para borrar */
 .swipe { overflow: hidden; touch-action: pan-y; }
@@ -263,8 +259,6 @@ h1, h2, p { margin: 0; }
 .es-text { flex: 1; min-width: 0; }
 .es-text h2 { font-size: 16px; line-height: 1.25; margin-bottom: 2px; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
 .es-text p { font-size: 13px; margin: 0; }
-.es-play { width: 52px; height: 52px; background: var(--accent); color: var(--on-accent); }
-.es-play:active { background: var(--accent); opacity: 0.85; }
 .desc { margin-top: 14px; font-size: 15px; line-height: 1.5; max-height: 48vh; overflow-y: auto; }
 .small { font-size: 13px; margin-top: 10px; }
 

@@ -3,7 +3,7 @@
 /* =====================================================================
    Utilidades
    ===================================================================== */
-const APP_VERSION = 'v16';
+const APP_VERSION = 'v18';
 const SKIP = 30;
 const RATES = [1, 1.25, 1.5, 1.75, 2];
 const $ = (s, el = document) => el.querySelector(s);
@@ -50,8 +50,6 @@ const ICONS = {
   check: '<circle cx="12" cy="12" r="9"/><path d="M8 12.5l3 3 5-6"/>',
   plus: '<path d="M12 5v14M5 12h14"/>',
   trash: '<path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/>',
-  up: '<path d="M6 14l6-6 6 6"/>',
-  dn: '<path d="M6 10l6 6 6-6"/>',
   more: '<circle cx="5" cy="12" r="1.6" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/><circle cx="19" cy="12" r="1.6" fill="currentColor" stroke="none"/>',
   chevl: '<path d="M15 5l-7 7 7 7"/>',
   chevd: '<path d="M6 9l6 6 6-6"/>',
@@ -80,7 +78,7 @@ const jset = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } cat
 // Estado que se sincroniza entre dispositivos
 let state = Object.assign({ shows: {}, playlists: {}, episodes: {}, pos: {} }, jget(LS.state, {}));
 // Configuración de este dispositivo
-let cfg = Object.assign({ worker: '', key: '', rate: 1, autoDelete: false, lastSync: 0, last: null, trackKeys: 'skip' }, jget(LS.cfg, {}));
+let cfg = Object.assign({ worker: '', key: '', rate: 1, autoDelete: false, lastSync: 0, last: null, trackKeys: 'skip', keepAlive: false }, jget(LS.cfg, {}));
 let feeds = {};                          // showId -> { at, episodes: [] } (se guarda en IndexedDB)
 let dlMeta = jget(LS.dl, {});            // epId -> { size, at }
 let downloaded = new Set();              // epId descargados en este dispositivo (IndexedDB)
@@ -92,7 +90,7 @@ const epMap = new Map();
 const saveState = () => jset(LS.state, state);
 const saveCfg = () => jset(LS.cfg, cfg);
 const cfgOK = () => !!(cfg.worker && cfg.key);
-const findEp = (id) => epMap.get(id) || state.episodes[id] || null;
+const findEp = (id) => epMap.get(id) || state.episodes[id] || (dlMeta[id] && dlMeta[id].ep) || null;
 const visibleShows = () => Object.values(state.shows).filter((s) => !s.del).sort((a, b) => (a.added || 0) - (b.added || 0));
 const visibleLists = () => Object.values(state.playlists).filter((l) => !l.del).sort((a, b) => (a.order ?? a.added ?? 0) - (b.order ?? b.added ?? 0));
 
@@ -236,6 +234,13 @@ function mergeMaps(a, b, ts) {
   return out;
 }
 const norm = (s) => ({ shows: s?.shows || {}, playlists: s?.playlists || {}, episodes: s?.episodes || {}, pos: s?.pos || {} });
+// Las copias de episodios solo se sincronizan mientras estén en alguna lista (si no, el estado crece sin parar
+// y el puente rechaza lo que pase de ~900 KB)
+function pruneEpisodes() {
+  const used = new Set();
+  visibleLists().forEach((l) => l.items.forEach((id) => used.add(id)));
+  Object.keys(state.episodes).forEach((id) => { if (!used.has(id)) delete state.episodes[id]; });
+}
 function mergeState(a, b) {
   b = norm(b);
   return {
@@ -274,6 +279,7 @@ async function sync(manual = false) {
     const remote = norm(await (await api('/sync')).json());
     const before = stable(state);
     state = mergeState(state, remote);
+    pruneEpisodes();
     if (stable(state) !== before) {
       saveState(); render();
       visibleShows().filter((x) => !feeds[x.id]).forEach((x) => refreshShow(x.id, false));
@@ -407,15 +413,6 @@ function newList(name) {
   touch();
   return id;
 }
-function addToList(listId, epId) {
-  const l = state.playlists[listId], ep = findEp(epId);
-  if (!l || !ep) return;
-  if (l.items.includes(epId)) { toast('Ya está en esa lista'); return; }
-  state.episodes[epId] = { ...ep, mod: now() };
-  l.items.push(epId); l.mod = now();
-  touch();
-  toast('Añadido a ' + short(l.name, 24));
-}
 function addManyToList(listId, ids) {
   const l = state.playlists[listId];
   let added = 0, dup = 0;
@@ -451,10 +448,16 @@ function removeEverywhere(ids) {
   });
   touch();
 }
-function removeItemFromList(listId, epId) {
+// Quita los episodios de todas las listas y borra sus descargas; siguen disponibles en su programa
+async function purgeEpisodes(ids) {
+  removeEverywhere(ids);
+  for (const id of ids) {
+    if (downloaded.has(id)) { try { await deleteDl(id); } catch (e) { console.warn(e); } }
+  }
+}
+async function removeItemFromList(listId, epId) {
   if (!visibleLists().some((l) => l.items.includes(epId))) return;
-  removeEverywhere(epId);
-  if (downloaded.has(epId)) deleteDl(epId);
+  await purgeEpisodes([epId]);
   toast('Quitado de todas las listas');
   render();
 }
@@ -539,7 +542,7 @@ async function doDl(id) {
     if (blob.size < 50000) throw new Error('El archivo descargado está vacío');
     await idbSet(id, { blob, at: now() });
     downloaded.add(id);
-    dlMeta[id] = { size: blob.size, at: now() };
+    dlMeta[id] = { size: blob.size, at: now(), ep: { id: ep.id, showId: ep.showId, title: ep.title, audio: ep.audio, pub: ep.pub, dur: ep.dur, image: ep.image || '' } };   // datos para mostrarlo en Descargas aunque salga de las listas y del RSS
     jset(LS.dl, dlMeta);
     toast('Descargado: ' + short(ep.title, 32));
   } catch (e) {
@@ -602,7 +605,7 @@ async function playEp(id, q) {
   await loadEp(ep, true);
 }
 let preload = null;                       // { id, url }: el siguiente episodio descargado, ya leído de la memoria
-let handingOff = false, lastDurChange = 0;
+let handingOff = false, lastDurChange = 0, handoffTimer = 0, lastTU = 0, tuGap = 250;
 async function preloadNext() {
   const nid = queue[qi + 1];
   if (!nid || !downloaded.has(nid) || (preload && preload.id === nid)) return;
@@ -628,6 +631,7 @@ async function playWithRetry() {
   return false;
 }
 async function loadEp(ep, autoplay) {
+  clearTimeout(handoffTimer);
   saveCurrentPos();
   ready = false; triedProxy = false;
   cur = ep;
@@ -656,7 +660,7 @@ async function loadEp(ep, autoplay) {
   A.playbackRate = cfg.rate;
   setMedia(ep);
   renderMini(); renderPlayer(); markPlaying();
-  wantPlay = !!autoplay;
+  setWant(!!autoplay);
   if (autoplay) await playWithRetry();
   preloadNext();
 }
@@ -679,15 +683,58 @@ function skip(d) {
   A.currentTime = Math.min(dur, Math.max(0, A.currentTime + d));
 }
 let wantPlay = false;          // el usuario quiere que suene (pasa a false al pausar a propósito)
+let ac = null, kaOsc = null;   // audio inaudible opcional para que iOS no congele la app entre episodios
+function unlockAudio() {
+  if (!cfg.keepAlive) return;
+  try {
+    if (!ac) { const C = window.AudioContext || window.webkitAudioContext; if (!C) return; ac = new C(); }
+    if (ac.state === 'suspended') ac.resume();
+  } catch (e) { console.warn(e); }
+}
+function keepAliveSync() {
+  try {
+    const on = cfg.keepAlive && wantPlay && ac;
+    if (on && !kaOsc) {
+      if (ac.state === 'suspended') ac.resume();
+      const osc = ac.createOscillator(), g = ac.createGain();
+      osc.frequency.value = 30; g.gain.value = 0.0001;          // 30 Hz a -80 dB: inaudible
+      osc.connect(g); g.connect(ac.destination); osc.start();
+      kaOsc = { osc, g };
+    } else if (!on && kaOsc) {
+      kaOsc.osc.stop(); kaOsc.osc.disconnect(); kaOsc.g.disconnect(); kaOsc = null;
+    }
+  } catch (e) { console.warn(e); }
+}
+function setWant(v) { wantPlay = v; keepAliveSync(); }
 function togglePlay() {
   if (!cur) return;
-  if (A.paused) { wantPlay = true; A.play().catch((e) => console.warn(e)); }
-  else { wantPlay = false; A.pause(); }
+  if (A.paused) { setWant(true); A.play().catch((e) => console.warn(e)); }
+  else { setWant(false); A.pause(); }
 }
 function setPlaying(on) {
   $('#mini [data-act="toggle-play"]') && ($('#mini [data-act="toggle-play"]').innerHTML = icon(on ? 'pause' : 'play'));
   $('#player [data-act="toggle-play"]') && ($('#player [data-act="toggle-play"]').innerHTML = icon(on ? 'pause' : 'play'));
   if ('mediaSession' in navigator) navigator.mediaSession.playbackState = on ? 'playing' : 'paused';
+}
+function canHandoff() {
+  if (!cur || A.paused || handingOff || qi + 1 >= queue.length) return false;
+  if (!isFinite(A.duration) || A.duration <= 60) return false;
+  return cur.dur ? Math.abs(A.duration - cur.dur) <= Math.max(20, cur.dur * 0.04) : performance.now() - lastDurChange > 10000;
+}
+function handoffWindow() { return Math.min(2.5, Math.max(0.7, (tuGap / 1000) * 1.5 + 0.2)); }   // más ancha si los avisos llegan espaciados
+function scheduleHandoff() {
+  clearTimeout(handoffTimer);
+  if (!canHandoff()) return;
+  const id = cur.id, rem = A.duration - A.currentTime;
+  handoffTimer = setTimeout(() => {
+    if (cur && cur.id === id && canHandoff() && A.duration - A.currentTime < handoffWindow() + 0.4) advanceQueue();
+  }, Math.max(0, (rem - 0.4) * 1000 / (A.playbackRate || 1)));
+}
+// Al desbloquear el móvil: si el episodio terminó mientras estaba bloqueado y no se encadenó, se encadena ya
+function catchUpAfterHidden() {
+  if (!cur || !wantPlay || handingOff || qi + 1 >= queue.length) return;
+  const d = A.duration;
+  if ((A.ended || (isFinite(d) && d > 60 && d - A.currentTime < 1.2)) && A.paused) advanceQueue();
 }
 function onTime() {
   if (!cur || !ready) return;
@@ -698,12 +745,12 @@ function onTime() {
   if (mc) { const a = fmtTime(t); if (mc.textContent !== a) mc.textContent = a; }
   if (md) { const b = isFinite(d) ? fmtTime(d) : '0:00'; if (md.textContent !== b) md.textContent = b; }
   if (!scrubbing) updateScrubUI(t, d);
-  // Con el móvil bloqueado el aviso de «ha terminado» puede llegar tarde o no llegar: el relevo se hace
-  // medio segundo antes del final, cuando el audio sigue sonando y el sistema deja cambiar de episodio.
-  if (!A.paused && !handingOff && qi + 1 < queue.length && isFinite(A.duration) && A.duration > 60) {
+  // Con el móvil bloqueado el aviso de «ha terminado» puede llegar tarde o no llegar, y los avisos de progreso
+  // pueden espaciarse: el relevo se hace un poco antes del final, mientras el audio sigue sonando.
+  if (canHandoff()) {
     const rem = A.duration - t;
-    const fiable = cur.dur ? Math.abs(A.duration - cur.dur) <= Math.max(20, cur.dur * 0.04) : performance.now() - lastDurChange > 10000;
-    if (fiable && rem > 0 && rem < 0.7) { advanceQueue(); return; }
+    if (rem > 0 && rem < handoffWindow()) { advanceQueue(); return; }
+    if (rem < 600) scheduleHandoff();
   }
   if (performance.now() - lastSave > 5000) saveCurrentPos();
   if (performance.now() - lastPosState > 1000 && 'mediaSession' in navigator && d && isFinite(d)) {
@@ -722,6 +769,7 @@ function updateScrubUI(t, d) {
 }
 function advanceQueue() {
   if (!cur || handingOff) return;
+  clearTimeout(handoffTimer);
   handingOff = true;
   state.pos[cur.id] = { t: Math.floor(A.duration || 0), d: Math.floor(A.duration || 0), done: true, at: now() };
   touch();
@@ -733,7 +781,7 @@ function advanceQueue() {
     if (next) { loadEp(next, true); return; }
   }
   handingOff = false;
-  wantPlay = false;
+  setWant(false);
   setPlaying(false);
   render();
 }
@@ -756,9 +804,14 @@ function onAudioError() {
   }
   toast(navigator.onLine ? 'No se puede reproducir este episodio' : 'Sin conexión. Descarga el episodio para escucharlo sin red.');
 }
-A.addEventListener('play', () => { wantPlay = true; setPlaying(true); });
+A.addEventListener('play', () => { setWant(true); setPlaying(true); });
 A.addEventListener('pause', () => { setPlaying(false); saveCurrentPos(); syncSoon(3000); render(); });
-A.addEventListener('timeupdate', onTime);
+A.addEventListener('timeupdate', () => {
+  const n = performance.now();
+  if (lastTU && n - lastTU < 5000) tuGap = Math.min(3000, Math.max(200, 0.7 * tuGap + 0.3 * (n - lastTU)));
+  lastTU = n;
+  onTime();
+});
 A.addEventListener('ended', onEnded);
 A.addEventListener('error', onAudioError);
 A.addEventListener('durationchange', () => { lastDurChange = performance.now(); if (ready) onTime(); });
@@ -775,8 +828,8 @@ function setMedia(ep) {
 (function mediaKeys() {
   if (!('mediaSession' in navigator)) return;
   const h = (a, f) => { try { navigator.mediaSession.setActionHandler(a, f); } catch {} };
-  h('play', () => { wantPlay = true; A.play().catch(() => {}); });
-  h('pause', () => { wantPlay = false; A.pause(); });
+  h('play', () => { setWant(true); A.play().catch(() => {}); });
+  h('pause', () => { setWant(false); A.pause(); });
   h('seekbackward', () => skip(-SKIP));
   h('seekforward', () => skip(SKIP));
   // «Siguiente» y «anterior» (doble y triple pulsación de los AirPods, Siri, botones de la pantalla de bloqueo):
@@ -903,7 +956,7 @@ function headHtml() {
     if (!l || l.del) return '';
     return selecting ? selBar('list') : `<header class="top sub">${back}<div class="top-actions"><button class="icon-btn" data-act="list-menu" data-id="${l.id}" aria-label="Más opciones">${icon('more')}</button></div></header>`;
   }
-  if (route.dl) return selecting ? selBar('dl') : `<header class="top sub">${back}<div class="top-actions"></div></header>`;
+  if (route.dl) return selecting ? selBar('dl') : `<header class="top sub">${back}<div class="top-actions">${downloaded.size ? `<button class="icon-btn" data-act="sel-all" aria-label="Seleccionar todos">${icon('checkall')}</button>` : ''}</div></header>`;
   return '';
 }
 function showEpsToShow(s) {
@@ -1012,6 +1065,8 @@ function viewSettings() {
     <button class="btn danger wide" data-act="clear-dl" style="margin-top:8px">Borrar todas las descargas</button></section>
   <section class="sect"><h2>AirPods y Siri</h2><p>Qué hacen «siguiente» y «anterior»: doble y triple pulsación de los AirPods, «oye Siri, pista siguiente» y los botones de la pantalla de bloqueo.</p>
     <div class="seg" role="group"><button class="${cfg.trackKeys !== 'episode' ? 'on' : ''}" data-act="track-mode" data-mode="skip" aria-pressed="${cfg.trackKeys !== 'episode'}">Saltar 30 s</button><button class="${cfg.trackKeys === 'episode' ? 'on' : ''}" data-act="track-mode" data-mode="episode" aria-pressed="${cfg.trackKeys === 'episode'}">Cambiar de episodio</button></div></section>
+  <section class="sect"><h2>Pantalla bloqueada</h2><p>Si al terminar un episodio no pasa solo al siguiente hasta que desbloqueas el móvil, prueba esta opción experimental: mantiene el audio activo entre episodios con un sonido inaudible. Gasta algo más de batería.</p>
+    <label class="switch"><span>Mantener activa la reproducción</span><input type="checkbox" data-act="toggle-keepalive" ${cfg.keepAlive ? 'checked' : ''}></label></section>
   <section class="sect"><h2>Aplicación</h2><div class="dl-line"><p>Versión ${APP_VERSION}</p><button class="btn" data-act="update-app">Actualizar la app</button></div>
     <p class="status">Borra la copia guardada de la app y la vuelve a cargar. No toca tus descargas, listas ni programas.</p></section>
   ${hint}</div>`;
@@ -1234,6 +1289,7 @@ const actions = {
   },
   'open-ep': (el, id) => {
     if (sel.size) { toggleSel(id); return; }
+    if (route.dl) { enterSel(id); return; }       // en Descargas, tocar un episodio lo selecciona
     openEpSheet(id, el.dataset.list, el.dataset.i);
   },
   'panel-play': (el, id) => {
@@ -1287,7 +1343,6 @@ const actions = {
     if (!name) return;
     const lid = newList(name); go({ tab: 'lists', list: lid });
   },
-  'toggle-sel': (el, id) => toggleSel(id),
   'sel-cancel': () => exitSel(),
   'sel-all': () => {
     unfocus();
@@ -1295,7 +1350,9 @@ const actions = {
     if (route.dl) ids = downloadedIds();
     else { const l = state.playlists[route.list]; ids = l ? l.items.slice() : []; }
     if (ids.length && ids.every((x) => sel.has(x))) { exitSel(); return; }
-    ids.forEach((x) => sel.add(x)); applySelUI();
+    ids.forEach((x) => sel.add(x));
+    if (sel.size && !selPushed) { history.pushState({ ...route, sel: true }, ''); selPushed = true; }
+    applySelUI();
   },
   'sel-add': () => pickListSheet(Array.from(sel), true),
   'more-eps': () => { const q = (ui.epq || '').trim(); ui.epN = (ui.epN || (q ? 100 : 40)) + 60; updateShowList(); },
@@ -1303,10 +1360,9 @@ const actions = {
   'sel-remove': () => {
     const n = sel.size, ids = Array.from(sel);
     if (route.dl) {
-      sheet(`<h2>${n} episodio${n === 1 ? '' : 's'} descargado${n === 1 ? '' : 's'}</h2>
-        <p>"Borrar la descarga" libera espacio, pero el episodio se queda en sus listas. "Borrar episodio y descarga" también lo quita de todas las listas.</p>
-        <div class="row-stack"><button class="btn danger wide" data-act="dl-del-files">Borrar la descarga</button>
-        <button class="btn danger wide" data-act="dl-del-all">Borrar episodio y descarga</button>
+      const uno = n === 1;
+      sheet(`<h2>Borrar ${n} episodio${uno ? '' : 's'}</h2><p>${uno ? 'Se quitará de todas las listas donde esté y se borrará su descarga. Sigue disponible en su programa.' : 'Se quitarán de todas las listas donde estén y se borrarán sus descargas. Siguen disponibles en su programa.'}</p>
+        <div class="row-stack"><button class="btn danger wide" data-act="dl-del-all">Borrar de listas y descargas</button>
         <button class="btn wide" data-act="close-sheet">Cancelar</button></div>`);
       return;
     }
@@ -1316,8 +1372,7 @@ const actions = {
       <button class="btn wide" data-act="close-sheet">Cancelar</button></div>`);
   },
   'sel-remove-ok': () => removeSelected(),
-  'dl-del-files': () => deleteDownloads(Array.from(sel), false),
-  'dl-del-all': () => deleteDownloads(Array.from(sel), true),
+  'dl-del-all': () => deleteDownloads(Array.from(sel)),
   'list-menu': (el, id) => sheet(`<h2>${esc(state.playlists[id]?.name || '')}</h2><ul class="sheet-list"><li><button data-act="list-rename" data-id="${id}">Cambiar nombre</button></li><li><button data-act="list-delete" data-id="${id}">Eliminar lista</button></li></ul><button class="btn wide" data-act="close-sheet">Cerrar</button>`),
   'list-rename': async (el, id) => {
     const l = state.playlists[id]; closeSheet();
@@ -1404,21 +1459,17 @@ function toggleSel(id) {
   if (sel.has(id)) sel.delete(id); else sel.add(id);
   if (!sel.size) exitSel(); else applySelUI();
 }
-function removeSelected() {
+async function removeSelected() {
   const ids = Array.from(sel);
   closeSheet();
-  removeEverywhere(ids);
-  ids.forEach((x) => { if (downloaded.has(x)) deleteDl(x); });
+  await purgeEpisodes(ids);
   toast(`Quitado${ids.length === 1 ? '' : 's'} ${ids.length} episodio${ids.length === 1 ? '' : 's'} de todas las listas`);
   exitSel(); render();
 }
-async function deleteDownloads(ids, alsoFromLists) {
+async function deleteDownloads(ids) {
   closeSheet();
-  for (const id of ids) {
-    if (alsoFromLists) removeEverywhere(id);
-    try { await deleteDl(id); } catch (e) { console.warn(e); }
-  }
-  toast(alsoFromLists ? `Borrado${ids.length === 1 ? '' : 's'} ${ids.length} episodio${ids.length === 1 ? '' : 's'} y su descarga` : `Borrada${ids.length === 1 ? '' : 's'} ${ids.length} descarga${ids.length === 1 ? '' : 's'}`);
+  await purgeEpisodes(ids);
+  toast(`Borrado${ids.length === 1 ? '' : 's'} ${ids.length} episodio${ids.length === 1 ? '' : 's'} de las listas y de las descargas`);
   exitSel(); render();
 }
 function openShowMenu(id) {
@@ -1593,6 +1644,7 @@ document.addEventListener('pointerup', swipeEnd);
 document.addEventListener('pointercancel', swipeEnd);
 
 document.addEventListener('click', (e) => {
+  unlockAudio();
   const el = e.target.closest('[data-act]');
   if (!el || el.disabled || el.type === 'checkbox') return;
   const fn = actions[el.dataset.act];
@@ -1600,6 +1652,7 @@ document.addEventListener('click', (e) => {
 });
 document.addEventListener('change', (e) => {
   if (e.target.dataset?.act === 'toggle-autodel') { cfg.autoDelete = e.target.checked; saveCfg(); }
+  if (e.target.dataset?.act === 'toggle-keepalive') { cfg.keepAlive = e.target.checked; saveCfg(); unlockAudio(); keepAliveSync(); }
   if (e.target.id === 'p-range') {
     scrubbing = false;
     if (isFinite(A.duration)) A.currentTime = (e.target.value / 1000) * A.duration;
@@ -1624,8 +1677,10 @@ document.addEventListener('keydown', (e) => {
 });
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden') { saveCurrentPos(); syncSoon(1500); }
-  else { checkAudioSession(); if (cfgOK()) sync(); }
+  else { catchUpAfterHidden(); checkAudioSession(); if (cfgOK()) sync(); }
 });
+window.addEventListener('pageshow', catchUpAfterHidden);
+window.addEventListener('focus', catchUpAfterHidden);
 window.addEventListener('online', () => { if (cfgOK()) sync(); });
 
 /* =====================================================================

@@ -1,7 +1,6 @@
 // Cambia VERSION cada vez que subas una versión nueva de la app
-const VERSION = 'v16';
+const VERSION = 'v18';
 const SHELL_CACHE = 'shell-' + VERSION;
-const IMG_CACHE = 'img';
 const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'manifest.webmanifest', 'icon-180.png', 'icon-192.png', 'icon-512.png'];
 
 self.addEventListener('install', (e) => {
@@ -16,7 +15,7 @@ self.addEventListener('install', (e) => {
 self.addEventListener('activate', (e) => {
   e.waitUntil(
     caches.keys()
-      .then((keys) => Promise.all(keys.filter((k) => k !== SHELL_CACHE && k !== IMG_CACHE).map((k) => caches.delete(k))))
+      .then((keys) => Promise.all(keys.filter((k) => k !== SHELL_CACHE).map((k) => caches.delete(k))))   // también borra la antigua caché de imágenes
       .then(() => self.clients.claim())
   );
 });
@@ -27,10 +26,8 @@ self.addEventListener('fetch', (e) => {
   const url = new URL(req.url);
   if (url.origin === location.origin) {
     e.respondWith(networkFirst(e, req));
-  } else if (req.destination === 'image') {
-    e.respondWith(staleWhileRevalidate(e, IMG_CACHE, req));
   }
-  // El resto (puente, audios, RSS) va directo a la red
+  // El resto (puente, audios, RSS, imágenes) va directo a la red: las portadas las guarda la propia app
 });
 
 // Aplicación: siempre intenta la versión más reciente (revalidando con GitHub); si tarda más de 2,5 s o no hay red, usa la copia guardada
@@ -49,20 +46,4 @@ async function networkFirst(e, req) {
   let hit = await cache.match(req);
   if (!hit && req.mode === 'navigate') hit = (await cache.match('./')) || (await cache.match('index.html'));
   return hit || (await net.catch(() => Response.error()));
-}
-
-async function staleWhileRevalidate(e, cacheName, req) {
-  const cache = await caches.open(cacheName);
-  const hit = await cache.match(req);
-  const net = fetch(req)
-    .then((res) => {
-      if (res && (res.ok || res.type === 'opaque')) {
-        cache.put(req, res.clone());
-        cache.keys().then((k) => { if (k.length > 400) cache.delete(k[0]); });
-      }
-      return res;
-    })
-    .catch(() => null);
-  e.waitUntil(net);
-  return hit || (await net) || Response.error();
 }
