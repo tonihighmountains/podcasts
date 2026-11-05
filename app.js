@@ -3,7 +3,7 @@
 /* =====================================================================
    Utilidades
    ===================================================================== */
-const APP_VERSION = 'v18';
+const APP_VERSION = 'v19';
 const SKIP = 30;
 const RATES = [1, 1.25, 1.5, 1.75, 2];
 const $ = (s, el = document) => el.querySelector(s);
@@ -71,14 +71,15 @@ const icon = (n) =>
 /* =====================================================================
    Estado y almacenamiento local
    ===================================================================== */
-const LS = { state: 'pc.state', cfg: 'pc.cfg', feeds: 'pc.feeds', dl: 'pc.dl' };
+const LS = { state: 'pc.state', cfg: 'pc.cfg', feeds: 'pc.feeds', dl: 'pc.dl', log: 'pc.log' };
 const jget = (k, d) => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch { return d; } };
 const jset = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { console.warn(e); } };
 
 // Estado que se sincroniza entre dispositivos
 let state = Object.assign({ shows: {}, playlists: {}, episodes: {}, pos: {} }, jget(LS.state, {}));
 // Configuración de este dispositivo
-let cfg = Object.assign({ worker: '', key: '', rate: 1, autoDelete: false, lastSync: 0, last: null, trackKeys: 'skip', keepAlive: false }, jget(LS.cfg, {}));
+let cfg = Object.assign({ worker: '', key: '', rate: 1, autoDelete: false, lastSync: 0, last: null, trackKeys: 'skip', keepAlive: true, keepAliveUser: false }, jget(LS.cfg, {}));
+if (!cfg.keepAliveUser) cfg.keepAlive = true;      // salvo que el usuario la haya cambiado a mano, el audio entre episodios va activado
 let feeds = {};                          // showId -> { at, episodes: [] } (se guarda en IndexedDB)
 let dlMeta = jget(LS.dl, {});            // epId -> { size, at }
 let downloaded = new Set();              // epId descargados en este dispositivo (IndexedDB)
@@ -87,6 +88,18 @@ const dlCtl = {};
 const loading = {};
 const epMap = new Map();
 
+/* ---------- Registro de reproducción: apunta lo que ocurre al cambiar de episodio, para poder averiguar fallos ---------- */
+let plogBuf = jget(LS.log, []), plogT = 0;
+function plog(m) {
+  plogBuf.push([Date.now(), (document.visibilityState || '?')[0], String(m)]);
+  if (plogBuf.length > 400) plogBuf.splice(0, plogBuf.length - 400);
+  clearTimeout(plogT);
+  plogT = setTimeout(() => jset(LS.log, plogBuf), 1500);
+}
+function plogText(n = 220) {
+  const hd = `Podcasts ${typeof APP_VERSION === 'string' ? APP_VERSION : ''} - ${navigator.userAgent}\n(v = pantalla visible, h = pantalla bloqueada o app en segundo plano)\n`;
+  return hd + plogBuf.slice(-n).map(([t, v, m]) => `${new Date(t).toLocaleTimeString('es-ES', { hour12: false })} ${v} ${m}`).join('\n');
+}
 const saveState = () => jset(LS.state, state);
 const saveCfg = () => jset(LS.cfg, cfg);
 const cfgOK = () => !!(cfg.worker && cfg.key);
@@ -605,48 +618,61 @@ async function playEp(id, q) {
   await loadEp(ep, true);
 }
 let preload = null;                       // { id, url }: el siguiente episodio descargado, ya leído de la memoria
-let handingOff = false, lastDurChange = 0, handoffTimer = 0, lastTU = 0, tuGap = 250;
+let handingOff = false, lastDurChange = 0, handoffTimer = 0, lastTU = 0, tuGap = 250, lastNear = 0, blobRetried = false, needsKick = false;
+// Las direcciones de archivos descargados no se anulan al momento: el audio que se está dejando podría seguir leyéndolas
+function retireUrl(u) { if (u) setTimeout(() => { try { URL.revokeObjectURL(u); } catch {} }, 20000); }
 async function preloadNext() {
   const nid = queue[qi + 1];
   if (!nid || !downloaded.has(nid) || (preload && preload.id === nid)) return;
   try {
     const rec = await idbGet(nid);
     if (rec && rec.blob && queue[qi + 1] === nid) {
-      if (preload) URL.revokeObjectURL(preload.url);
+      if (preload) retireUrl(preload.url);
       preload = { id: nid, url: URL.createObjectURL(rec.blob) };
+      plog('siguiente descargado preparado en memoria');
     }
   } catch (e) { console.warn(e); }
 }
 async function playWithRetry() {
   for (let i = 0; i < 3; i++) {
-    try { await A.play(); return true; }
+    try { await A.play(); plog('play() correcto' + (i ? ` (intento ${i + 1})` : '')); needsKick = false; return true; }
     catch (e) {
+      plog('play() falló: ' + (e && e.name) + ' ' + ((e && e.message) || ''));
       console.warn(e);
       if (e && e.name === 'NotAllowedError') break;           // el sistema exige tocar play: no se puede forzar
       await new Promise((r) => setTimeout(r, 400));
     }
   }
+  needsKick = true;                                            // se reintenta al volver a la app
+  if (!A.paused) return true;
   setPlaying(false);
   if (document.visibilityState === 'visible') toast('Pulsa play para continuar');
   return false;
 }
+// Al volver a la app (o al primer toque), si un episodio no llegó a arrancar, se reintenta
+function kickIfNeeded() {
+  if (!needsKick || !wantPlay || !cur || !A.paused) return;
+  plog('reintento de reproducción al volver a la app');
+  A.play().then(() => { needsKick = false; }).catch((e) => plog('el reintento falló: ' + (e && e.name)));
+}
 async function loadEp(ep, autoplay) {
-  clearTimeout(handoffTimer);
+  clearTimeout(handoffTimer); handoffTimer = 0;
   saveCurrentPos();
-  ready = false; triedProxy = false;
+  ready = false; triedProxy = false; blobRetried = false;
   cur = ep;
-  if (objUrl) { URL.revokeObjectURL(objUrl); objUrl = null; }
-  if (preload && preload.id !== ep.id) { URL.revokeObjectURL(preload.url); preload = null; }
-  let src = ep.audio;
+  retireUrl(objUrl); objUrl = null;
+  if (preload && preload.id !== ep.id) { retireUrl(preload.url); preload = null; }
+  let src = ep.audio, origen = 'red';
   if (downloaded.has(ep.id)) {
-    if (preload && preload.id === ep.id) { objUrl = preload.url; src = objUrl; preload = null; }   // sin esperar a la memoria
+    if (preload && preload.id === ep.id) { objUrl = preload.url; src = objUrl; preload = null; origen = 'descarga (ya preparada)'; }   // sin esperar a la memoria
     else {
       try {
         const rec = await idbGet(ep.id);
-        if (rec && rec.blob) { objUrl = URL.createObjectURL(rec.blob); src = objUrl; }
+        if (rec && rec.blob) { objUrl = URL.createObjectURL(rec.blob); src = objUrl; origen = 'descarga (leída ahora)'; }
       } catch (e) { console.warn(e); }
     }
   }
+  plog(`cargar «${short(ep.title, 40)}» desde ${origen}`);
   const p = state.pos[ep.id];
   startAt = p && !p.done && p.t > 5 ? p.t : 0;
   A.src = src;
@@ -697,11 +723,13 @@ function keepAliveSync() {
     if (on && !kaOsc) {
       if (ac.state === 'suspended') ac.resume();
       const osc = ac.createOscillator(), g = ac.createGain();
-      osc.frequency.value = 30; g.gain.value = 0.0001;          // 30 Hz a -80 dB: inaudible
+      osc.frequency.value = 30; g.gain.value = 0.002;           // 30 Hz a unos -54 dB: inaudible, pero por encima del umbral de silencio del sistema
       osc.connect(g); g.connect(ac.destination); osc.start();
+      plog('audio inaudible activado');
       kaOsc = { osc, g };
     } else if (!on && kaOsc) {
       kaOsc.osc.stop(); kaOsc.osc.disconnect(); kaOsc.g.disconnect(); kaOsc = null;
+      plog('audio inaudible desactivado');
     }
   } catch (e) { console.warn(e); }
 }
@@ -716,25 +744,58 @@ function setPlaying(on) {
   $('#player [data-act="toggle-play"]') && ($('#player [data-act="toggle-play"]').innerHTML = icon(on ? 'pause' : 'play'));
   if ('mediaSession' in navigator) navigator.mediaSession.playbackState = on ? 'playing' : 'paused';
 }
-function canHandoff() {
-  if (!cur || A.paused || handingOff || qi + 1 >= queue.length) return false;
-  if (!isFinite(A.duration) || A.duration <= 60) return false;
-  return cur.dur ? Math.abs(A.duration - cur.dur) <= Math.max(20, cur.dur * 0.04) : performance.now() - lastDurChange > 10000;
+// Motivo por el que NO se puede hacer el relevo ahora (cadena vacía = se puede)
+function handoffBlock() {
+  if (!cur) return 'sin episodio';
+  if (A.paused) return 'en pausa';
+  if (handingOff) return 'relevo en curso';
+  if (qi + 1 >= queue.length) return 'último de la lista';
+  if (!isFinite(A.duration) || A.duration <= 10) return `duración no válida (${A.duration})`;
+  if (objUrl && A.src === objUrl) return '';                       // descargado: manda la duración del archivo
+  if (cur.dur && Math.abs(A.duration - cur.dur) <= Math.max(20, cur.dur * 0.04)) return '';
+  if (performance.now() - lastDurChange > 6000) return '';         // en línea: la duración lleva 6 s sin cambiar
+  return `duración aún inestable (RSS ${cur.dur || '?'} s, audio ${Math.round(A.duration)} s)`;
 }
+const canHandoff = () => !handoffBlock();
 function handoffWindow() { return Math.min(2.5, Math.max(0.7, (tuGap / 1000) * 1.5 + 0.2)); }   // más ancha si los avisos llegan espaciados
+let handoffId = '', handoffDue = 0;
 function scheduleHandoff() {
-  clearTimeout(handoffTimer);
   if (!canHandoff()) return;
   const id = cur.id, rem = A.duration - A.currentTime;
+  const delay = Math.max(0, (rem - 0.4) * 1000 / (A.playbackRate || 1));
+  const due = performance.now() + delay;
+  if (handoffTimer && handoffId === id && handoffDue <= due + 100) return;      // ya hay uno programado igual de pronto
+  clearTimeout(handoffTimer);
+  handoffId = id; handoffDue = due;
   handoffTimer = setTimeout(() => {
-    if (cur && cur.id === id && canHandoff() && A.duration - A.currentTime < handoffWindow() + 0.4) advanceQueue();
-  }, Math.max(0, (rem - 0.4) * 1000 / (A.playbackRate || 1)));
+    handoffTimer = 0;
+    if (cur && cur.id === id && canHandoff() && A.duration - A.currentTime < handoffWindow() + 0.4) advanceQueue('temporizador');
+  }, delay);
 }
+// Comprueba si toca pasar al siguiente episodio (lo llaman los avisos de progreso y un latido propio)
+function checkHandoff(medir) {
+  if (!cur || !isFinite(A.duration)) return false;
+  const rem = A.duration - A.currentTime;
+  if (rem > 0 && rem < 4 && performance.now() - lastNear > 1000) {
+    lastNear = performance.now();
+    plog(`faltan ${rem.toFixed(1)} s · ventana ${handoffWindow().toFixed(1)} s · ${handoffBlock() || 'relevo posible'}`);
+  }
+  if (handoffBlock()) return false;
+  if (medir) {
+    const n = performance.now();
+    if (lastTU && n - lastTU < 5000) tuGap = Math.min(3000, Math.max(200, 0.7 * tuGap + 0.3 * (n - lastTU)));
+    lastTU = n;
+  }
+  if (rem > 0 && rem < handoffWindow()) { advanceQueue('ventana'); return true; }
+  if (rem < 600) scheduleHandoff();
+  return false;
+}
+setInterval(() => { if (cur && ready && !A.paused && !handingOff) checkHandoff(false); }, 400);   // por si los avisos de progreso se espacian o se pierden
 // Al desbloquear el móvil: si el episodio terminó mientras estaba bloqueado y no se encadenó, se encadena ya
 function catchUpAfterHidden() {
   if (!cur || !wantPlay || handingOff || qi + 1 >= queue.length) return;
   const d = A.duration;
-  if ((A.ended || (isFinite(d) && d > 60 && d - A.currentTime < 1.2)) && A.paused) advanceQueue();
+  if ((A.ended || (isFinite(d) && d > 10 && d - A.currentTime < 1.2)) && A.paused) advanceQueue('al volver a la app');
 }
 function onTime() {
   if (!cur || !ready) return;
@@ -747,11 +808,7 @@ function onTime() {
   if (!scrubbing) updateScrubUI(t, d);
   // Con el móvil bloqueado el aviso de «ha terminado» puede llegar tarde o no llegar, y los avisos de progreso
   // pueden espaciarse: el relevo se hace un poco antes del final, mientras el audio sigue sonando.
-  if (canHandoff()) {
-    const rem = A.duration - t;
-    if (rem > 0 && rem < handoffWindow()) { advanceQueue(); return; }
-    if (rem < 600) scheduleHandoff();
-  }
+  if (checkHandoff(true)) return;
   if (performance.now() - lastSave > 5000) saveCurrentPos();
   if (performance.now() - lastPosState > 1000 && 'mediaSession' in navigator && d && isFinite(d)) {
     lastPosState = performance.now();
@@ -767,9 +824,9 @@ function updateScrubUI(t, d) {
   c.textContent = fmtTime(t);
   l.textContent = d ? '/ ' + fmtTime(d) : '';
 }
-function advanceQueue() {
+function advanceQueue(motivo) {
   if (!cur || handingOff) return;
-  clearTimeout(handoffTimer);
+  clearTimeout(handoffTimer); handoffTimer = 0;
   handingOff = true;
   state.pos[cur.id] = { t: Math.floor(A.duration || 0), d: Math.floor(A.duration || 0), done: true, at: now() };
   touch();
@@ -778,42 +835,62 @@ function advanceQueue() {
   if (qi + 1 < queue.length) {
     qi++;
     const next = findEp(queue[qi]);
-    if (next) { loadEp(next, true); return; }
+    if (next) { plog(`relevo (${motivo || '?'}) → «${short(next.title, 40)}»`); loadEp(next, true); return; }
+    plog('relevo: no se encuentra el siguiente episodio de la lista');
   }
   handingOff = false;
   setWant(false);
   setPlaying(false);
   render();
 }
-function onEnded() { advanceQueue(); }
+function onEnded() { plog('evento «ended»'); advanceQueue('fin del audio'); }
+function streamFallback(t, porPuente) {
+  A.src = porPuente ? proxyUrl(cur.audio) : cur.audio;
+  A.addEventListener('loadedmetadata', () => { ready = true; A.playbackRate = cfg.rate; if (t) { try { A.currentTime = t; } catch {} } onTime(); }, { once: true });
+  A.play().catch(() => {});
+}
+async function reloadBlob(ep, t) {
+  try {
+    const rec = await idbGet(ep.id);
+    if (!rec || !rec.blob || !cur || cur.id !== ep.id) throw new Error('el archivo ya no está');
+    retireUrl(objUrl);
+    objUrl = URL.createObjectURL(rec.blob);
+    A.src = objUrl;
+    A.addEventListener('loadedmetadata', () => { ready = true; A.playbackRate = cfg.rate; if (t) { try { A.currentTime = t; } catch {} } onTime(); }, { once: true });
+    await A.play();
+    plog('descarga leída de nuevo: correcto');
+  } catch (e) {
+    plog('no se pudo leer de nuevo la descarga: ' + e.message);
+    if (cur && cur.id === ep.id) { toast('No se pudo leer la descarga: se reproduce en línea'); streamFallback(t, false); }
+  }
+}
 function onAudioError() {
   if (!cur) return;
-  if (objUrl && A.src === objUrl) {
-    toast('La descarga está dañada. Se borra y se reproduce en línea.');
-    const id = cur.id; deleteDl(id);
-    A.src = cur.audio; A.play().catch(() => {});
+  const code = A.error ? A.error.code : 0;
+  const local = !!(objUrl && A.src === objUrl);
+  plog(`ERROR de audio, código ${code} (${local ? 'archivo descargado' : 'en línea'})`);
+  const t = ready ? A.currentTime : startAt;
+  if (local) {                                                    // la descarga NUNCA se borra por un error de lectura
+    if (!blobRetried) { blobRetried = true; reloadBlob(cur, t); return; }
+    toast('No se pudo leer la descarga: se reproduce en línea');
+    streamFallback(t, false);
     return;
   }
-  if (!triedProxy && cfgOK() && navigator.onLine) {
-    triedProxy = true;
-    const t = ready ? A.currentTime : startAt;
-    A.src = proxyUrl(cur.audio);
-    A.addEventListener('loadedmetadata', () => { ready = true; A.playbackRate = cfg.rate; if (t) { try { A.currentTime = t; } catch {} } onTime(); }, { once: true });
-    A.play().catch(() => {});
-    return;
-  }
+  if (!triedProxy && cfgOK() && navigator.onLine) { triedProxy = true; streamFallback(t, true); return; }
   toast(navigator.onLine ? 'No se puede reproducir este episodio' : 'Sin conexión. Descarga el episodio para escucharlo sin red.');
 }
-A.addEventListener('play', () => { setWant(true); setPlaying(true); });
-A.addEventListener('pause', () => { setPlaying(false); saveCurrentPos(); syncSoon(3000); render(); });
-A.addEventListener('timeupdate', () => {
-  const n = performance.now();
-  if (lastTU && n - lastTU < 5000) tuGap = Math.min(3000, Math.max(200, 0.7 * tuGap + 0.3 * (n - lastTU)));
-  lastTU = n;
-  onTime();
+A.addEventListener('play', () => { needsKick = false; plog('evento «play»'); setWant(true); setPlaying(true); });
+A.addEventListener('pause', () => {
+  const cambiando = wantPlay && !ready;                           // cambio de episodio en curso: no es una pausa de verdad
+  const alFinal = wantPlay && qi + 1 < queue.length && (A.ended || (isFinite(A.duration) && A.duration - A.currentTime < 1));
+  plog('evento «pause»' + (cambiando ? ' (cambio de episodio)' : alFinal ? ' (fin, sigue otro)' : ''));
+  if (!cambiando && !alFinal) setPlaying(false);                 // así Android no retira la notificación entre episodios
+  if (!cambiando) { saveCurrentPos(); syncSoon(3000); render(); }
 });
+A.addEventListener('timeupdate', onTime);
 A.addEventListener('ended', onEnded);
 A.addEventListener('error', onAudioError);
+['waiting', 'stalled', 'emptied', 'loadedmetadata'].forEach((n) => A.addEventListener(n, () => plog('evento «' + n + '»')));
 A.addEventListener('durationchange', () => { lastDurChange = performance.now(); if (ready) onTime(); });
 
 function setMedia(ep) {
@@ -828,14 +905,14 @@ function setMedia(ep) {
 (function mediaKeys() {
   if (!('mediaSession' in navigator)) return;
   const h = (a, f) => { try { navigator.mediaSession.setActionHandler(a, f); } catch {} };
-  h('play', () => { setWant(true); A.play().catch(() => {}); });
-  h('pause', () => { setWant(false); A.pause(); });
+  h('play', () => { plog('botón multimedia: play'); setWant(true); A.play().catch(() => {}); });
+  h('pause', () => { plog('botón multimedia: pausa'); setWant(false); A.pause(); });
   h('seekbackward', () => skip(-SKIP));
   h('seekforward', () => skip(SKIP));
   // «Siguiente» y «anterior» (doble y triple pulsación de los AirPods, Siri, botones de la pantalla de bloqueo):
   // según el ajuste, saltan 30 s o cambian de episodio
-  h('nexttrack', () => { if (cfg.trackKeys === 'episode') nextEp(); else skip(SKIP); });
-  h('previoustrack', () => { if (cfg.trackKeys === 'episode') prevEp(); else skip(-SKIP); });
+  h('nexttrack', () => { plog('botón multimedia: siguiente'); if (cfg.trackKeys === 'episode') nextEp(); else skip(SKIP); });
+  h('previoustrack', () => { plog('botón multimedia: anterior'); if (cfg.trackKeys === 'episode') prevEp(); else skip(-SKIP); });
   h('seekto', (d) => { if (d.seekTime != null) A.currentTime = d.seekTime; });
 })();
 
@@ -1065,8 +1142,10 @@ function viewSettings() {
     <button class="btn danger wide" data-act="clear-dl" style="margin-top:8px">Borrar todas las descargas</button></section>
   <section class="sect"><h2>AirPods y Siri</h2><p>Qué hacen «siguiente» y «anterior»: doble y triple pulsación de los AirPods, «oye Siri, pista siguiente» y los botones de la pantalla de bloqueo.</p>
     <div class="seg" role="group"><button class="${cfg.trackKeys !== 'episode' ? 'on' : ''}" data-act="track-mode" data-mode="skip" aria-pressed="${cfg.trackKeys !== 'episode'}">Saltar 30 s</button><button class="${cfg.trackKeys === 'episode' ? 'on' : ''}" data-act="track-mode" data-mode="episode" aria-pressed="${cfg.trackKeys === 'episode'}">Cambiar de episodio</button></div></section>
-  <section class="sect"><h2>Pantalla bloqueada</h2><p>Si al terminar un episodio no pasa solo al siguiente hasta que desbloqueas el móvil, prueba esta opción experimental: mantiene el audio activo entre episodios con un sonido inaudible. Gasta algo más de batería.</p>
+  <section class="sect"><h2>Pantalla bloqueada</h2><p>Mantiene el audio activo entre episodios con un sonido inaudible, para que el móvil no suspenda la app al pasar de un episodio al siguiente con la pantalla bloqueada. Gasta algo más de batería.</p>
     <label class="switch"><span>Mantener activa la reproducción</span><input type="checkbox" data-act="toggle-keepalive" ${cfg.keepAlive ? 'checked' : ''}></label></section>
+  <section class="sect"><h2>Registro de reproducción</h2><p>Apunta lo que ocurre al cambiar de episodio. Si algo falla, haz la prueba, pulsa «Copiar» y pégame el texto para ver qué pasó.</p>
+    <div class="row-btns"><button class="btn" data-act="log-view">Ver</button><button class="btn" data-act="log-copy">Copiar</button><button class="btn" data-act="log-clear">Borrar</button></div></section>
   <section class="sect"><h2>Aplicación</h2><div class="dl-line"><p>Versión ${APP_VERSION}</p><button class="btn" data-act="update-app">Actualizar la app</button></div>
     <p class="status">Borra la copia guardada de la app y la vuelve a cargar. No toca tus descargas, listas ni programas.</p></section>
   ${hint}</div>`;
@@ -1303,6 +1382,20 @@ const actions = {
   'ep-prev': () => prevEp(),
   'ep-next': () => nextEp(),
   'open-dl': () => go({ tab: 'settings', dl: true }),
+  'log-view': () => {
+    const t = plogBuf.length ? plogText(120) : 'Todavía no hay nada registrado. Reproduce una lista y vuelve aquí.';
+    sheet(`<h2>Registro de reproducción</h2><pre class="plog">${esc(t)}</pre><div class="row-btns"><button class="btn" data-act="log-copy">Copiar</button><button class="btn" data-act="close-sheet">Cerrar</button></div>`);
+  },
+  'log-copy': async () => {
+    const t = plogText();
+    try { await navigator.clipboard.writeText(t); toast('Registro copiado'); }
+    catch {
+      const ta = document.createElement('textarea'); ta.value = t; ta.style.cssText = 'position:fixed;opacity:0'; document.body.appendChild(ta); ta.select();
+      try { document.execCommand('copy'); toast('Registro copiado'); } catch { toast('No se pudo copiar'); }
+      ta.remove();
+    }
+  },
+  'log-clear': () => { plogBuf = []; jset(LS.log, plogBuf); toast('Registro borrado'); },
   'track-mode': (el) => {
     cfg.trackKeys = el.dataset.mode; saveCfg();
     el.parentElement.querySelectorAll('button').forEach((b) => { const on = b === el; b.classList.toggle('on', on); b.setAttribute('aria-pressed', String(on)); });
@@ -1652,7 +1745,7 @@ document.addEventListener('click', (e) => {
 });
 document.addEventListener('change', (e) => {
   if (e.target.dataset?.act === 'toggle-autodel') { cfg.autoDelete = e.target.checked; saveCfg(); }
-  if (e.target.dataset?.act === 'toggle-keepalive') { cfg.keepAlive = e.target.checked; saveCfg(); unlockAudio(); keepAliveSync(); }
+  if (e.target.dataset?.act === 'toggle-keepalive') { cfg.keepAlive = e.target.checked; cfg.keepAliveUser = true; saveCfg(); unlockAudio(); keepAliveSync(); }
   if (e.target.id === 'p-range') {
     scrubbing = false;
     if (isFinite(A.duration)) A.currentTime = (e.target.value / 1000) * A.duration;
@@ -1676,11 +1769,16 @@ document.addEventListener('keydown', (e) => {
   else if (t.dataset?.bind === 'rss') { e.preventDefault(); addRss(); }
 });
 document.addEventListener('visibilitychange', () => {
+  plog('pantalla ' + (document.visibilityState === 'hidden' ? 'bloqueada / en segundo plano' : 'visible') + (cur ? ` · ${wantPlay ? 'debería sonar' : 'en pausa'}, audio ${A.paused ? 'parado' : 'sonando'}` : ''));
   if (document.visibilityState === 'hidden') { saveCurrentPos(); syncSoon(1500); }
-  else { catchUpAfterHidden(); checkAudioSession(); if (cfgOK()) sync(); }
+  else { catchUpAfterHidden(); kickIfNeeded(); checkAudioSession(); if (cfgOK()) sync(); }
 });
-window.addEventListener('pageshow', catchUpAfterHidden);
-window.addEventListener('focus', catchUpAfterHidden);
+window.addEventListener('pageshow', (e) => { plog('pageshow' + (e.persisted ? ' (restaurada)' : '')); catchUpAfterHidden(); kickIfNeeded(); });
+window.addEventListener('focus', () => { catchUpAfterHidden(); kickIfNeeded(); });
+window.addEventListener('pagehide', () => plog('pagehide'));
+document.addEventListener('freeze', () => plog('LA APP HA SIDO CONGELADA por el sistema'));
+document.addEventListener('resume', () => plog('la app se ha reanudado tras estar congelada'));
+document.addEventListener('pointerdown', kickIfNeeded, true);
 window.addEventListener('online', () => { if (cfgOK()) sync(); });
 
 /* =====================================================================

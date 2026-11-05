@@ -343,3 +343,6 @@ h1, h2, p { margin: 0; }
 .mini-prog { flex: 0 0 100%; display: flex; align-items: center; gap: 10px; padding: 1px 10px 0 2px; }
 .mini-bar { position: static; flex: 1; height: 4px; border-radius: 2px; overflow: hidden; }
 .mini-time { flex: none; font-size: 11.5px; line-height: 1; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+/* Registro de reproducción */
+.plog { margin: 0 0 4px; padding: 10px; border-radius: 10px; background: var(--bg); color: var(--text); font: 11px/1.4 ui-monospace, "SF Mono", Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; max-height: 52vh; overflow: auto; -webkit-user-select: text; user-select: text; }
