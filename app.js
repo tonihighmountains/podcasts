@@ -3,7 +3,7 @@
 /* =====================================================================
    Utilidades
    ===================================================================== */
-const APP_VERSION = 'v19';
+const APP_VERSION = 'v20';
 const SKIP = 30;
 const RATES = [1, 1.25, 1.5, 1.75, 2];
 const $ = (s, el = document) => el.querySelector(s);
@@ -710,18 +710,33 @@ function skip(d) {
 }
 let wantPlay = false;          // el usuario quiere que suene (pasa a false al pausar a propósito)
 let ac = null, kaOsc = null;   // audio inaudible opcional para que iOS no congele la app entre episodios
+// iOS añade el estado «interrupted» (tras una llamada o Siri): hay que reanudar tanto ese como «suspended»
+function resumeAc() {
+  if (!ac || (ac.state !== 'suspended' && ac.state !== 'interrupted')) return;
+  try { const p = ac.resume(); if (p && p.catch) p.catch(() => {}); } catch {}
+}
+function onAcState() {
+  plog('audio inaudible: estado «' + (ac && ac.state) + '»');
+  if (wantPlay && cfg.keepAlive) resumeAc();
+}
 function unlockAudio() {
   if (!cfg.keepAlive) return;
   try {
-    if (!ac) { const C = window.AudioContext || window.webkitAudioContext; if (!C) return; ac = new C(); }
-    if (ac.state === 'suspended') ac.resume();
+    if (!ac) {
+      const C = window.AudioContext || window.webkitAudioContext;
+      if (!C) return;
+      ac = new C();
+      if (ac.addEventListener) ac.addEventListener('statechange', onAcState);
+      plog('audio inaudible preparado: estado «' + ac.state + '»');
+    }
+    resumeAc();
   } catch (e) { console.warn(e); }
 }
 function keepAliveSync() {
   try {
     const on = cfg.keepAlive && wantPlay && ac;
     if (on && !kaOsc) {
-      if (ac.state === 'suspended') ac.resume();
+      resumeAc();
       const osc = ac.createOscillator(), g = ac.createGain();
       osc.frequency.value = 30; g.gain.value = 0.002;           // 30 Hz a unos -54 dB: inaudible, pero por encima del umbral de silencio del sistema
       osc.connect(g); g.connect(ac.destination); osc.start();
@@ -929,7 +944,7 @@ function resumeAfterInterruption() {
 function checkAudioSession() {
   const st = navigator.audioSession && navigator.audioSession.state;
   if (st === 'interrupted') { wasInterrupted = true; return; }
-  if (wasInterrupted) { wasInterrupted = false; if (wantPlay) resumeAfterInterruption(); }
+  if (wasInterrupted) { wasInterrupted = false; plog('fin de la interrupción del audio (llamada, Siri…)'); unlockAudio(); keepAliveSync(); if (wantPlay) resumeAfterInterruption(); }
 }
 if (navigator.audioSession) {
   try { navigator.audioSession.type = 'playback'; } catch {}
@@ -1390,8 +1405,9 @@ const actions = {
     const t = plogText();
     try { await navigator.clipboard.writeText(t); toast('Registro copiado'); }
     catch {
-      const ta = document.createElement('textarea'); ta.value = t; ta.style.cssText = 'position:fixed;opacity:0'; document.body.appendChild(ta); ta.select();
-      try { document.execCommand('copy'); toast('Registro copiado'); } catch { toast('No se pudo copiar'); }
+      const ta = document.createElement('textarea'); ta.value = t; ta.style.cssText = 'position:fixed;top:0;left:0;opacity:0;font-size:16px'; document.body.appendChild(ta);
+      ta.focus(); ta.select(); try { ta.setSelectionRange(0, t.length); } catch {}
+      try { document.execCommand('copy') ? toast('Registro copiado') : toast('No se pudo copiar: pulsa «Ver» y copia el texto a mano'); } catch { toast('No se pudo copiar: pulsa «Ver» y copia el texto a mano'); }
       ta.remove();
     }
   },
@@ -1771,7 +1787,7 @@ document.addEventListener('keydown', (e) => {
 document.addEventListener('visibilitychange', () => {
   plog('pantalla ' + (document.visibilityState === 'hidden' ? 'bloqueada / en segundo plano' : 'visible') + (cur ? ` · ${wantPlay ? 'debería sonar' : 'en pausa'}, audio ${A.paused ? 'parado' : 'sonando'}` : ''));
   if (document.visibilityState === 'hidden') { saveCurrentPos(); syncSoon(1500); }
-  else { catchUpAfterHidden(); kickIfNeeded(); checkAudioSession(); if (cfgOK()) sync(); }
+  else { catchUpAfterHidden(); kickIfNeeded(); unlockAudio(); checkAudioSession(); if (cfgOK()) sync(); }
 });
 window.addEventListener('pageshow', (e) => { plog('pageshow' + (e.persisted ? ' (restaurada)' : '')); catchUpAfterHidden(); kickIfNeeded(); });
 window.addEventListener('focus', () => { catchUpAfterHidden(); kickIfNeeded(); });
