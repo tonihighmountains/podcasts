@@ -3,7 +3,7 @@
 /* =====================================================================
    Utilidades
    ===================================================================== */
-const APP_VERSION = 'v20';
+const APP_VERSION = 'v21';
 const SKIP = 30;
 const RATES = [1, 1.25, 1.5, 1.75, 2];
 const $ = (s, el = document) => el.querySelector(s);
@@ -78,7 +78,8 @@ const jset = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } cat
 // Estado que se sincroniza entre dispositivos
 let state = Object.assign({ shows: {}, playlists: {}, episodes: {}, pos: {} }, jget(LS.state, {}));
 // Configuración de este dispositivo
-let cfg = Object.assign({ worker: '', key: '', rate: 1, autoDelete: false, lastSync: 0, last: null, trackKeys: 'skip', keepAlive: true, keepAliveUser: false }, jget(LS.cfg, {}));
+let cfg = Object.assign({ worker: '', key: '', rate: 1, autoDelete: false, lastSync: 0, last: null, trackKeys: 'episode', trackKeysUser: false, keepAlive: true, keepAliveUser: false }, jget(LS.cfg, {}));
+if (!cfg.trackKeysUser) cfg.trackKeys = 'episode';   // «siguiente pista» de Siri cambia de episodio, salvo que el usuario haya elegido otra cosa
 if (!cfg.keepAliveUser) cfg.keepAlive = true;      // salvo que el usuario la haya cambiado a mano, el audio entre episodios va activado
 let feeds = {};                          // showId -> { at, episodes: [] } (se guarda en IndexedDB)
 let dlMeta = jget(LS.dl, {});            // epId -> { size, at }
@@ -572,6 +573,7 @@ function cancelDl(id) {
   refreshDl(id);
 }
 async function deleteDl(id) {
+  plog('descarga borrada: «' + short((findEp(id) || {}).title || id, 40) + '»');
   try { await idbDel(id); } catch (e) { console.warn(e); }
   downloaded.delete(id); delete dlMeta[id]; jset(LS.dl, dlMeta);
   refreshDl(id); refreshStorageInfo();
@@ -657,6 +659,7 @@ function kickIfNeeded() {
 }
 async function loadEp(ep, autoplay) {
   clearTimeout(handoffTimer); handoffTimer = 0;
+  sysPause = null; clearTimeout(resumeT);
   saveCurrentPos();
   ready = false; triedProxy = false; blobRetried = false;
   cur = ep;
@@ -717,7 +720,8 @@ function resumeAc() {
 }
 function onAcState() {
   plog('audio inaudible: estado «' + (ac && ac.state) + '»');
-  if (wantPlay && cfg.keepAlive) resumeAc();
+  if (ac && ac.state === 'interrupted') { noteInterruption('AudioContext'); pauseForInterruption(); return; }
+  if (wantPlay && cfg.keepAlive && !sysPause && !A.paused) resumeAc();     // durante una llamada o Siri NO se fuerza
 }
 function unlockAudio() {
   if (!cfg.keepAlive) return;
@@ -734,7 +738,8 @@ function unlockAudio() {
 }
 function keepAliveSync() {
   try {
-    const on = cfg.keepAlive && wantPlay && ac;
+    const enMarcha = !A.paused || !ready || handingOff || A.ended || (isFinite(A.duration) && A.duration - A.currentTime < 1.5);
+    const on = cfg.keepAlive && wantPlay && ac && !sysPause && enMarcha;
     if (on && !kaOsc) {
       resumeAc();
       const osc = ac.createOscillator(), g = ac.createGain();
@@ -748,11 +753,13 @@ function keepAliveSync() {
     }
   } catch (e) { console.warn(e); }
 }
-function setWant(v) { wantPlay = v; keepAliveSync(); }
+function setWant(v) { wantPlay = v; if (!v) { sysPause = null; clearTimeout(resumeT); } keepAliveSync(); }
+let sysPause = null, resumeT = 0, selfPause = 0, lastInterruptAt = 0;   // ver «Llamadas, Siri y otras interrupciones»
+function pauseByUs() { selfPause = now(); A.pause(); }
 function togglePlay() {
   if (!cur) return;
   if (A.paused) { setWant(true); A.play().catch((e) => console.warn(e)); }
-  else { setWant(false); A.pause(); }
+  else { setWant(false); pauseByUs(); }
 }
 function setPlaying(on) {
   $('#mini [data-act="toggle-play"]') && ($('#mini [data-act="toggle-play"]').innerHTML = icon(on ? 'pause' : 'play'));
@@ -894,13 +901,15 @@ function onAudioError() {
   if (!triedProxy && cfgOK() && navigator.onLine) { triedProxy = true; streamFallback(t, true); return; }
   toast(navigator.onLine ? 'No se puede reproducir este episodio' : 'Sin conexión. Descarga el episodio para escucharlo sin red.');
 }
-A.addEventListener('play', () => { needsKick = false; plog('evento «play»'); setWant(true); setPlaying(true); });
+A.addEventListener('play', () => { needsKick = false; sysPause = null; clearTimeout(resumeT); plog('evento «play»'); setWant(true); setPlaying(true); });
 A.addEventListener('pause', () => {
   const cambiando = wantPlay && !ready;                           // cambio de episodio en curso: no es una pausa de verdad
   const alFinal = wantPlay && qi + 1 < queue.length && (A.ended || (isFinite(A.duration) && A.duration - A.currentTime < 1));
   plog('evento «pause»' + (cambiando ? ' (cambio de episodio)' : alFinal ? ' (fin, sigue otro)' : ''));
   if (!cambiando && !alFinal) setPlaying(false);                 // así Android no retira la notificación entre episodios
   if (!cambiando) { saveCurrentPos(); syncSoon(3000); render(); }
+  keepAliveSync();
+  if (!cambiando && !alFinal && wantPlay && now() - selfPause > 1500) systemPaused();     // pausa que no ha pedido ni la app ni el usuario
 });
 A.addEventListener('timeupdate', onTime);
 A.addEventListener('ended', onEnded);
@@ -917,39 +926,109 @@ function setMedia(ep) {
     artwork: art ? [{ src: art, sizes: '512x512' }] : [],
   });
 }
+const fmtSalto = (sg) => { sg = Math.abs(Math.round(sg)); return sg < 60 ? `${sg} s` : sg % 60 === 0 ? `${sg / 60} min` : `${Math.floor(sg / 60)} min ${sg % 60} s`; };
+function jump(sg) {
+  skip(sg);
+  plog(`salto ${sg > 0 ? '+' : '-'}${fmtSalto(sg)}`);
+  if (document.visibilityState === 'visible') toast((sg > 0 ? 'Adelantado ' : 'Retrocedido ') + fmtSalto(sg));
+}
+// Modo «saltar tiempo»: si se repite en pocos segundos, el salto crece (30 s, 1, 2 y 5 min)
+const SALTOS = [30, 60, 120, 300];
+let growIdx = 0, growAt = 0, growDir = 1;
+function growJump(dir) {
+  const n = now();
+  growIdx = n - growAt < 5000 && dir === growDir ? Math.min(growIdx + 1, SALTOS.length - 1) : 0;
+  growAt = n; growDir = dir;
+  jump(dir * SALTOS[growIdx]);
+}
 (function mediaKeys() {
   if (!('mediaSession' in navigator)) return;
-  const h = (a, f) => { try { navigator.mediaSession.setActionHandler(a, f); } catch {} };
-  h('play', () => { plog('botón multimedia: play'); setWant(true); A.play().catch(() => {}); });
-  h('pause', () => { plog('botón multimedia: pausa'); setWant(false); A.pause(); });
-  h('seekbackward', () => skip(-SKIP));
-  h('seekforward', () => skip(SKIP));
-  // «Siguiente» y «anterior» (doble y triple pulsación de los AirPods, Siri, botones de la pantalla de bloqueo):
-  // según el ajuste, saltan 30 s o cambian de episodio
-  h('nexttrack', () => { plog('botón multimedia: siguiente'); if (cfg.trackKeys === 'episode') nextEp(); else skip(SKIP); });
-  h('previoustrack', () => { plog('botón multimedia: anterior'); if (cfg.trackKeys === 'episode') prevEp(); else skip(-SKIP); });
+  // Cada orden se anota en el registro con todos sus datos y el tiempo desde la última interrupción
+  const h = (a, f) => {
+    try {
+      navigator.mediaSession.setActionHandler(a, (d) => {
+        const hace = lastInterruptAt ? ` · interrupción hace ${Math.round((now() - lastInterruptAt) / 1000)} s` : '';
+        plog(`orden «${a}» ${JSON.stringify(d || {})}${hace}`);
+        f(d || {});
+      });
+    } catch {}
+  };
+  // «Adelanta 40 segundos» / «retrocede 5 minutos»: se usa el tiempo que mande el sistema. 10 s es el valor por defecto de
+  // iOS para los botones de la pantalla de bloqueo, y en ese caso se usa el salto propio de 30 s.
+  const tiempo = (d) => (typeof d.seekOffset === 'number' && d.seekOffset > 0 && d.seekOffset !== 10 ? d.seekOffset : SKIP);
+  h('play', () => { setWant(true); A.play().catch(() => {}); });
+  h('pause', () => { setWant(false); pauseByUs(); });
+  h('stop', () => { setWant(false); pauseByUs(); });
+  h('seekbackward', (d) => jump(-tiempo(d)));
+  h('seekforward', (d) => jump(tiempo(d)));
+  // «Siguiente» y «anterior» (Siri, AirPods, pantalla de bloqueo): cambian de episodio o saltan tiempo según el ajuste
+  h('nexttrack', () => { if (cfg.trackKeys === 'episode') nextEp(); else growJump(1); });
+  h('previoustrack', () => { if (cfg.trackKeys === 'episode') prevEp(); else growJump(-1); });
   h('seekto', (d) => { if (d.seekTime != null) A.currentTime = d.seekTime; });
 })();
 
-/* Llamadas y otras interrupciones del audio: al terminar, se reanuda si estaba sonando */
+/* Llamadas, Siri y otras interrupciones del audio.
+   - Si el sistema pausa el audio, se espera a que la interrupción termine y se reanuda solo (si estaba sonando).
+   - Si hay una interrupción y el audio sigue sonando (Siri dictando una nota), se pausa hasta que termine.
+   - Una pausa SIN señal de interrupción (por ejemplo, quitarse un AirPod) no se reanuda sola. */
 let wasInterrupted = false;
-function resumeAfterInterruption() {
-  let tries = 0;
-  const go = () => {
-    if (!wantPlay || !cur || !A.paused || ++tries > 15) return;
-    A.play().catch(() => setTimeout(go, 1000));
-  };
-  setTimeout(go, 300);
+function noteInterruption(origen) { lastInterruptAt = now(); plog('señal de interrupción del audio (' + origen + ')'); }
+function interruptionEvidence() {
+  return now() - lastInterruptAt < 4000 || !!(navigator.audioSession && navigator.audioSession.state === 'interrupted') || !!(ac && ac.state === 'interrupted');
 }
-function checkAudioSession() {
+function scheduleResume(ms) { clearTimeout(resumeT); resumeT = setTimeout(tryResume, ms); }
+function tryResume() {
+  const sp = sysPause;
+  if (!sp || !wantPlay || !cur) { sysPause = null; keepAliveSync(); return; }
+  if (!A.paused) { sysPause = null; keepAliveSync(); return; }
+  if (now() - sp.at > 15 * 60e3) { plog('se deja de intentar reanudar (han pasado 15 minutos)'); sysPause = null; keepAliveSync(); return; }
+  if (navigator.audioSession && navigator.audioSession.state === 'interrupted') { scheduleResume(2000); return; }
+  sp.tries++;
+  A.play().then(() => plog(`reanudación automática: play() correcto (intento ${sp.tries})`))
+    .catch((e) => plog(`reanudación automática: play() falló (${e && e.name}, intento ${sp.tries})`));
+  scheduleResume(sp.tries < 30 ? 2500 : 10000);
+}
+function systemPaused() {
+  if (sysPause) return;
+  sysPause = { at: now(), tries: 0, evidencia: interruptionEvidence() };
+  keepAliveSync();                                                // el audio inaudible no se mantiene durante la interrupción
+  setTimeout(() => {                                              // las señales pueden llegar uno o dos segundos después de la pausa
+    if (!sysPause) return;
+    if (!sysPause.evidencia) sysPause.evidencia = interruptionEvidence();
+    const sinSenales = !navigator.audioSession && !ac;           // sin forma de saberlo: se supone que es una interrupción
+    if (sysPause.evidencia || sinSenales) { plog('pausa del sistema por una interrupción: se reanudará al terminar'); scheduleResume(1500); }
+    else { plog('pausa del sistema sin señal de interrupción (¿auricular quitado?): no se reanuda sola'); sysPause = null; keepAliveSync(); }
+  }, 1800);
+}
+function pauseForInterruption() {
+  if (!wantPlay || !cur || A.paused || sysPause) return;
+  plog('interrupción con el audio sonando: se pausa hasta que termine (Siri, llamada…)');
+  sysPause = { at: now(), tries: 0, evidencia: true };
+  keepAliveSync();
+  try { A.pause(); } catch {}
+  scheduleResume(4000);                                           // respaldo por si nunca llega el aviso de fin
+}
+function interruptionEnded(origen) {
+  plog('fin de la interrupción del audio (' + origen + ')');
+  if (!wantPlay || !cur) return;
+  if (!sysPause) sysPause = { at: now(), tries: 0, evidencia: true };
+  sysPause.evidencia = true;
+  scheduleResume(400);
+}
+function checkAudioSession() {                                    // por si se perdió el aviso de fin al estar bloqueado el móvil
   const st = navigator.audioSession && navigator.audioSession.state;
-  if (st === 'interrupted') { wasInterrupted = true; return; }
-  if (wasInterrupted) { wasInterrupted = false; plog('fin de la interrupción del audio (llamada, Siri…)'); unlockAudio(); keepAliveSync(); if (wantPlay) resumeAfterInterruption(); }
+  if (wasInterrupted && st && st !== 'interrupted') { wasInterrupted = false; interruptionEnded('al volver a la app'); }
 }
 if (navigator.audioSession) {
   try { navigator.audioSession.type = 'playback'; } catch {}
-  navigator.audioSession.addEventListener('statechange', checkAudioSession);
-}
+  plog('audioSession disponible, estado «' + navigator.audioSession.state + '»');
+  navigator.audioSession.addEventListener('statechange', () => {
+    const st = navigator.audioSession.state;
+    plog('audioSession: estado «' + st + '»');
+    if (st === 'interrupted') { wasInterrupted = true; noteInterruption('audioSession'); pauseForInterruption(); }
+    else if (wasInterrupted) { wasInterrupted = false; interruptionEnded('audioSession'); }
+  });
+} else plog('audioSession NO disponible en este navegador');
 
 function prevEp() {
   if (!cur) return;
@@ -1155,8 +1234,9 @@ function viewSettings() {
   <section class="sect"><h2>Descargas</h2><div class="dl-line"><p id="storage-info"></p><button class="btn" data-act="open-dl">Ver episodios</button></div>
     <label class="switch"><span>Borrar la descarga al terminar un episodio</span><input type="checkbox" data-act="toggle-autodel" ${cfg.autoDelete ? 'checked' : ''}></label>
     <button class="btn danger wide" data-act="clear-dl" style="margin-top:8px">Borrar todas las descargas</button></section>
-  <section class="sect"><h2>AirPods y Siri</h2><p>Qué hacen «siguiente» y «anterior»: doble y triple pulsación de los AirPods, «oye Siri, pista siguiente» y los botones de la pantalla de bloqueo.</p>
-    <div class="seg" role="group"><button class="${cfg.trackKeys !== 'episode' ? 'on' : ''}" data-act="track-mode" data-mode="skip" aria-pressed="${cfg.trackKeys !== 'episode'}">Saltar 30 s</button><button class="${cfg.trackKeys === 'episode' ? 'on' : ''}" data-act="track-mode" data-mode="episode" aria-pressed="${cfg.trackKeys === 'episode'}">Cambiar de episodio</button></div></section>
+  <section class="sect"><h2>AirPods y Siri</h2><p>Qué hacen «siguiente» y «anterior»: «oye Siri, pon la siguiente pista», la doble y triple pulsación de los AirPods y los botones de la pantalla de bloqueo. «Adelanta 40 segundos», «retrocede 5 minutos», «pausa» y «reanuda» van aparte y no dependen de esta opción.</p>
+    <div class="seg" role="group"><button class="${cfg.trackKeys === 'episode' ? 'on' : ''}" data-act="track-mode" data-mode="episode" aria-pressed="${cfg.trackKeys === 'episode'}">Cambiar de episodio</button><button class="${cfg.trackKeys !== 'episode' ? 'on' : ''}" data-act="track-mode" data-mode="skip" aria-pressed="${cfg.trackKeys !== 'episode'}">Saltar tiempo</button></div>
+    <p class="status">«Saltar tiempo»: 30 s, y si repites en 5 segundos, 1 min, 2 min y 5 min.</p></section>
   <section class="sect"><h2>Pantalla bloqueada</h2><p>Mantiene el audio activo entre episodios con un sonido inaudible, para que el móvil no suspenda la app al pasar de un episodio al siguiente con la pantalla bloqueada. Gasta algo más de batería.</p>
     <label class="switch"><span>Mantener activa la reproducción</span><input type="checkbox" data-act="toggle-keepalive" ${cfg.keepAlive ? 'checked' : ''}></label></section>
   <section class="sect"><h2>Registro de reproducción</h2><p>Apunta lo que ocurre al cambiar de episodio. Si algo falla, haz la prueba, pulsa «Copiar» y pégame el texto para ver qué pasó.</p>
@@ -1413,7 +1493,7 @@ const actions = {
   },
   'log-clear': () => { plogBuf = []; jset(LS.log, plogBuf); toast('Registro borrado'); },
   'track-mode': (el) => {
-    cfg.trackKeys = el.dataset.mode; saveCfg();
+    cfg.trackKeys = el.dataset.mode; cfg.trackKeysUser = true; saveCfg();
     el.parentElement.querySelectorAll('button').forEach((b) => { const on = b === el; b.classList.toggle('on', on); b.setAttribute('aria-pressed', String(on)); });
     $('#view')._html = null;
   },
