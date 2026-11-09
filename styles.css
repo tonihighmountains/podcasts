@@ -346,3 +346,8 @@ h1, h2, p { margin: 0; }
 
 /* Registro de reproducción */
 .plog { margin: 0 0 4px; padding: 10px; border-radius: 10px; background: var(--bg); color: var(--text); font: 11px/1.4 ui-monospace, "SF Mono", Menlo, Consolas, monospace; white-space: pre-wrap; word-break: break-word; max-height: 52vh; overflow: auto; -webkit-user-select: text; user-select: text; }
+
+/* Botón pequeño del reproductor (Android): qué hacen ⏮⏭ */
+.pill { min-height: 36px; padding: 0 14px; border-radius: 18px; background: var(--surface2); font-size: 13px; font-weight: 650; white-space: nowrap; }
+.pill:active { opacity: 0.8; }
+.transport2 { gap: 18px; flex-wrap: wrap; }

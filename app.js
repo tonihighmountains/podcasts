@@ -3,8 +3,9 @@
 /* =====================================================================
    Utilidades
    ===================================================================== */
-const APP_VERSION = 'v24';
-const ES_IOS = /iPhone|iPad|iPod/i.test(navigator.userAgent);   // en iPhone mandan Siri y los AirPods; en Android, los botones de la pantalla de bloqueo
+const APP_VERSION = 'v25';
+const ES_IOS = /iPhone|iPad|iPod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const DUAL = !ES_IOS;      // Android y demás: dos elementos de audio, el segundo prepara el siguiente episodio (relevo sin silencio)   // en iPhone mandan Siri y los AirPods; en Android, los botones de la pantalla de bloqueo
 const RAPIDO = !!window.__PC_RAPIDO;                 // solo para las pruebas automáticas: acorta las esperas
 const T_PRIMER_INTENTO = RAPIDO ? 600 : 12000;       // tras una interrupción, primer intento de reanudar
 const T_SONDEO = RAPIDO ? 900 : 8000;                // si en este tiempo vuelve a pausarse, la interrupción sigue
@@ -82,8 +83,8 @@ const jset = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } cat
 // Estado que se sincroniza entre dispositivos
 let state = Object.assign({ shows: {}, playlists: {}, episodes: {}, pos: {} }, jget(LS.state, {}));
 // Configuración de este dispositivo
-let cfg = Object.assign({ worker: '', key: '', rate: 1, autoDelete: false, lastSync: 0, last: null, keepAlive: true, keepAliveUser: false }, jget(LS.cfg, {}));
-if (!cfg.keepAliveUser) cfg.keepAlive = true;      // salvo que el usuario la haya cambiado a mano, el audio entre episodios va activado
+let cfg = Object.assign({ worker: '', key: '', rate: 1, autoDelete: false, lastSync: 0, last: null, keepAlive: true, keepAliveUser: false, npMode: 'time' }, jget(LS.cfg, {}));
+if (!cfg.keepAliveUser) cfg.keepAlive = ES_IOS;      // en Android no aporta nada con el reproductor de dos elementos; en iPhone se mantiene      // salvo que el usuario la haya cambiado a mano, el audio entre episodios va activado
 let feeds = {};                          // showId -> { at, episodes: [] } (se guarda en IndexedDB)
 let dlMeta = jget(LS.dl, {});            // epId -> { size, at }
 let downloaded = new Set();              // epId descargados en este dispositivo (IndexedDB)
@@ -609,7 +610,8 @@ function refreshStorageInfo() {
 /* =====================================================================
    Reproductor
    ===================================================================== */
-const A = $('#audio');
+let A = $('#audio');           // elemento de audio activo
+let B = null;                  // segundo elemento (solo DUAL): el que prepara el siguiente episodio
 let cur = null, queue = [], qi = -1, ready = false, objUrl = null, triedProxy = false;
 let lastSave = 0, lastPosState = 0, scrubbing = false, startAt = 0;
 
@@ -669,7 +671,9 @@ async function loadEp(ep, autoplay) {
   retireUrl(objUrl); objUrl = null;
   if (preload && preload.id !== ep.id) { retireUrl(preload.url); preload = null; }
   let src = ep.audio, origen = 'red';
-  if (downloaded.has(ep.id)) {
+  if (DUAL && standby && standby.id === ep.id && standby.blobUrl) {
+    objUrl = standby.blobUrl; src = objUrl; standby.blobUrl = null; origen = 'descarga (preparada en el segundo reproductor)';
+  } else if (downloaded.has(ep.id)) {
     if (preload && preload.id === ep.id) { objUrl = preload.url; src = objUrl; preload = null; origen = 'descarga (ya preparada)'; }   // sin esperar a la memoria
     else {
       try {
@@ -678,6 +682,7 @@ async function loadEp(ep, autoplay) {
       } catch (e) { console.warn(e); }
     }
   }
+  if (DUAL && standby && standby.id === ep.id) dropStandby();
   plog(`cargar «${short(ep.title, 40)}» desde ${origen}`);
   const p = state.pos[ep.id];
   startAt = p && !p.done && p.t > 5 ? p.t : 0;
@@ -694,7 +699,94 @@ async function loadEp(ep, autoplay) {
   renderMini(); renderPlayer(); markPlaying();
   setWant(!!autoplay);
   if (autoplay) await playWithRetry();
-  preloadNext();
+  if (DUAL) prepareStandby(); else preloadNext();
+}
+/* ---------- Segundo reproductor (Android y demás): el siguiente episodio se prepara con el sonido ya cargado y empieza
+   un poco antes de que acabe el actual, que se desvanece. Nunca se cambia la fuente de un audio que está sonando
+   (en el Samsung, Android pausaba el audio justo después de ese cambio). ---------- */
+let standby = null, fading = null, pendingPrepare = false;
+const standbyReady = () => !!(standby && standby.ready && !standby.error && standby.el && standby.el.readyState >= 2);
+function newAudioEl() {
+  const el = document.createElement('audio');
+  el.preload = 'auto'; el.setAttribute('playsinline', ''); el.style.display = 'none';
+  document.body.appendChild(el);
+  wireAudio(el);
+  return el;
+}
+function dropStandby() {
+  const st = standby; standby = null;
+  if (!st) return;
+  if (st.blobUrl) retireUrl(st.blobUrl);
+  const el = st.el;
+  if (el && el !== A && el !== fading) { try { el.pause(); el.removeAttribute('src'); el.load(); } catch {} }
+}
+function prepareStandby() {
+  if (!DUAL) return;
+  if (fading) { pendingPrepare = true; return; }                  // el elemento anterior aún se está desvaneciendo
+  const nid = queue[qi + 1];
+  if (!nid) { dropStandby(); return; }
+  if (standby && standby.id === nid) return;
+  dropStandby();
+  const ep = findEp(nid);
+  if (!ep) return;
+  const st = { id: nid, ep, ready: false, error: false, el: null, url: '', blobUrl: null, startAt: 0 };
+  standby = st;
+  (async () => {
+    let src = ep.audio;
+    if (downloaded.has(nid)) {
+      try { const rec = await idbGet(nid); if (rec && rec.blob) { st.blobUrl = URL.createObjectURL(rec.blob); src = st.blobUrl; } } catch (e) { console.warn(e); }
+    }
+    if (standby !== st) { if (st.blobUrl) retireUrl(st.blobUrl); return; }
+    if (!B) B = newAudioEl();
+    const el = B;
+    st.el = el; st.url = src;
+    const p = state.pos[nid];
+    st.startAt = p && !p.done && p.t > 5 ? p.t : 0;
+    el.addEventListener('canplay', () => {
+      if (standby !== st || st.ready) return;
+      st.ready = true;
+      if (st.startAt) { try { el.currentTime = st.startAt; } catch {} }
+      plog(`siguiente preparado en el segundo reproductor: «${short(ep.title, 40)}»`);
+    }, { once: true });
+    el.addEventListener('error', () => { if (standby === st) { st.error = true; plog('segundo reproductor: error al preparar el siguiente'); } }, { once: true });
+    try { el.volume = 1; el.playbackRate = cfg.rate; } catch {}
+    el.src = src;
+    try { el.load(); } catch {}
+  })();
+}
+function fadeOutAndRelease(el, blobUrl) {
+  let v = 1, hecho = false;
+  const fin = () => {
+    if (hecho) return;
+    hecho = true; clearInterval(iv); clearTimeout(tm);
+    try { el.pause(); el.removeAttribute('src'); el.load(); el.volume = 1; } catch {}
+    retireUrl(blobUrl);
+    if (fading === el) fading = null;
+    if (pendingPrepare) { pendingPrepare = false; prepareStandby(); }
+  };
+  const iv = setInterval(() => { v -= 0.25; try { el.volume = Math.max(0, v); } catch {} if (v <= 0) fin(); }, 100);
+  const tm = setTimeout(fin, 2000);                              // por si los temporizadores se espacian en segundo plano
+}
+// Pasa al episodio que ya está preparado: empieza el segundo elemento ANTES de soltar el primero
+function swapToStandby(motivo) {
+  const st = standby;
+  if (!st || !standbyReady()) return false;
+  const nb = st.el, old = A, oldObj = objUrl, ep = st.ep;
+  const t0 = performance.now();
+  let pr;
+  try { nb.playbackRate = cfg.rate; pr = nb.play(); } catch (e) { plog('segundo reproductor: play() lanzó ' + (e && e.name)); return false; }
+  qi++; cur = ep; objUrl = st.blobUrl; ready = true; triedProxy = false; blobRetried = false; startAt = st.startAt;
+  A = nb; B = old; standby = null; fading = old; pendingPrepare = true;
+  lastStartAt = lastPlayAt = now(); lastDurChange = performance.now();
+  setMedia(ep); renderMini(); renderPlayer(); markPlaying();
+  setWant(true);
+  plog(`relevo sin silencio (${motivo}) → «${short(ep.title, 40)}»`);
+  if (pr && pr.then) {
+    pr.then(() => plog(`segundo reproductor: play() correcto (${Math.round(performance.now() - t0)} ms)`))
+      .catch((e) => { plog('segundo reproductor: play() falló (' + (e && e.name) + '): se reintenta'); needsKick = true; playWithRetry(); });
+  }
+  fadeOutAndRelease(old, oldObj);
+  return true;
 }
 function markPlaying() {
   const v = $('#view');
@@ -782,7 +874,7 @@ function handoffBlock() {
   return `duración aún inestable (RSS ${cur.dur || '?'} s, audio ${Math.round(A.duration)} s)`;
 }
 const canHandoff = () => !handoffBlock();
-function handoffWindow() { return Math.min(2.5, Math.max(1.0, (tuGap / 1000) * 1.5 + 0.2)); }   // más ancha si los avisos llegan espaciados
+function handoffWindow() { return Math.min(2.5, Math.max(DUAL && standbyReady() ? 0.6 : 1.0, (tuGap / 1000) * 1.5 + 0.2)); }   // más ancha si los avisos llegan espaciados
 let handoffId = '', handoffDue = 0;
 function scheduleHandoff() {
   if (!canHandoff()) return;
@@ -849,15 +941,18 @@ function updateScrubUI(t, d) {
   c.textContent = fmtTime(t);
   l.textContent = d ? '/ ' + fmtTime(d) : '';
 }
+function markFinished() {
+  state.pos[cur.id] = { t: Math.floor(A.duration || 0), d: Math.floor(A.duration || 0), done: true, at: now() };
+  touch();
+  if (cfg.autoDelete && downloaded.has(cur.id)) deleteDl(cur.id);
+}
 function advanceQueue(motivo) {
   if (!cur || handingOff) return;
   clearTimeout(handoffTimer); handoffTimer = 0;
   handingOff = true;
-  state.pos[cur.id] = { t: Math.floor(A.duration || 0), d: Math.floor(A.duration || 0), done: true, at: now() };
-  touch();
-  const finished = cur.id;
-  if (cfg.autoDelete && downloaded.has(finished)) deleteDl(finished);
+  markFinished();
   if (qi + 1 < queue.length) {
+    if (DUAL && standbyReady() && swapToStandby(motivo || '?')) { handingOff = false; return; }
     qi++;
     const next = findEp(queue[qi]);
     if (next) { plog(`relevo (${motivo || '?'}) → «${short(next.title, 40)}»`); loadEp(next, true); return; }
@@ -904,35 +999,48 @@ function onAudioError() {
   if (!triedProxy && cfgOK() && navigator.onLine) { triedProxy = true; streamFallback(t, true); return; }
   toast(navigator.onLine ? 'No se puede reproducir este episodio' : 'Sin conexión. Descarga el episodio para escucharlo sin red.');
 }
-A.addEventListener('play', () => {
+function onPlayEvt() {
   needsKick = false; lastPlayAt = lastStartAt = now();
   const sondeando = sysPause && sysPause.resumedAt && now() - sysPause.resumedAt < T_SONDEO + 1000;
   if (!sondeando) { sysPause = null; clearTimeout(resumeT); }     // si es un intento nuestro, se mantiene hasta confirmar que aguanta
   plog('evento «play»'); setWant(true); setPlaying(true);
-});
-A.addEventListener('pause', () => {
+}
+function onPauseEvt() {
   const cambiando = wantPlay && !ready;                           // cambio de episodio en curso: no es una pausa de verdad
   const alFinal = wantPlay && qi + 1 < queue.length && (A.ended || (isFinite(A.duration) && A.duration - A.currentTime < 1));
   const propia = now() - selfPause < 1500;
-  const det = ` · ${A.currentTime.toFixed(1)}/${isFinite(A.duration) ? A.duration.toFixed(1) : '?'} s · readyState ${A.readyState}`;
+  const noti = 'mediaSession' in navigator ? ` · notificación «${navigator.mediaSession.playbackState}»` : '';
+  const det = ` · ${A.currentTime.toFixed(1)}/${isFinite(A.duration) ? A.duration.toFixed(1) : '?'} s · readyState ${A.readyState}${noti}`;
   plog('evento «pause»' + (cambiando ? ' (cambio de episodio)' : alFinal ? ' (fin, sigue otro)' : propia ? ' (pedida por el usuario)' : det));
   if (!cambiando && !alFinal) setPlaying(false);                 // así Android no retira la notificación entre episodios
   if (!cambiando) { saveCurrentPos(); syncSoon(3000); render(); }
   keepAliveSync();
   if (cambiando || alFinal || !wantPlay || propia) return;       // lo demás es una pausa que no ha pedido ni la app ni el usuario
   if (sysPause && sysPause.resumedAt && now() - sysPause.resumedAt < T_SONDEO + 500) {
+    if (!ES_IOS && sysPause.quick && sysPause.tries < 6) {       // Android: el sistema vuelve a pausar tras el intento; se insiste varias veces
+      clearTimeout(sysPause.probeT);
+      plog(`Android vuelve a pausar tras el intento ${sysPause.tries}: se reintenta`);
+      scheduleResume(300 * sysPause.tries);
+      return;
+    }
     sysPause.callActive = true; clearTimeout(sysPause.probeT);   // se vuelve a interrumpir justo tras nuestro intento: la interrupción sigue
     plog('la interrupción sigue (¿llamada en curso?): no se insiste, se espera a que termine');
     keepAliveSync();
     return;
   }
   systemPaused();
-});
-A.addEventListener('timeupdate', onTime);
-A.addEventListener('ended', onEnded);
-A.addEventListener('error', onAudioError);
-['waiting', 'stalled', 'emptied', 'loadedmetadata'].forEach((n) => A.addEventListener(n, () => plog('evento «' + n + '»')));
-A.addEventListener('durationchange', () => { lastDurChange = performance.now(); if (ready) onTime(); });
+}
+function wireAudio(el) {
+  const g = (f) => () => { if (el === A) f(); };                  // solo importa lo que dice el elemento activo
+  el.addEventListener('play', g(onPlayEvt));
+  el.addEventListener('pause', g(onPauseEvt));
+  el.addEventListener('timeupdate', g(onTime));
+  el.addEventListener('ended', g(onEnded));
+  el.addEventListener('error', g(onAudioError));
+  ['waiting', 'stalled', 'emptied', 'loadedmetadata'].forEach((n) => el.addEventListener(n, g(() => plog('evento «' + n + '»'))));
+  el.addEventListener('durationchange', g(() => { lastDurChange = performance.now(); if (ready) onTime(); }));
+}
+wireAudio(A);
 
 function setMedia(ep) {
   if (!('mediaSession' in navigator)) return;
@@ -965,7 +1073,7 @@ function growJump(dir) {
     try {
       navigator.mediaSession.setActionHandler(a, (d) => {
         const hace = lastInterruptAt ? ` · interrupción hace ${Math.round((now() - lastInterruptAt) / 1000)} s` : '';
-        plog(`orden «${a}» ${JSON.stringify(d || {})}${hace}`);
+        plog(`orden «${a}» ${JSON.stringify(d || {})}${hace} · notificación «${navigator.mediaSession.playbackState}»`);
         f(d || {});
       });
     } catch {}
@@ -987,9 +1095,9 @@ function growJump(dir) {
     jump(-tiempo(d));
   });
   // iPhone: doble y triple pulsación de los AirPods = saltos de tiempo que crecen si se repiten.
-  // Android: ⏮ ⏭ de la pantalla de bloqueo = episodio anterior / siguiente.
-  h('nexttrack', () => { if (ES_IOS) growJump(1); else nextEp(); });
-  h('previoustrack', () => { if (ES_IOS) growJump(-1); else prevEp(); });
+  // Android: ⏮ ⏭ de la pantalla de bloqueo y de los AirPods = lo mismo, o episodio anterior / siguiente según el botón del reproductor.
+  h('nexttrack', () => { if (ES_IOS || cfg.npMode !== 'episode') growJump(1); else nextEp(); });
+  h('previoustrack', () => { if (ES_IOS || cfg.npMode !== 'episode') growJump(-1); else prevEp(); });
   h('seekto', (d) => { if (d.seekTime != null) A.currentTime = d.seekTime; });
 })();
 
@@ -1021,6 +1129,7 @@ function tryResume() {
   sp.probeT = setTimeout(() => {                                  // ¿aguanta sonando, o la interrupción sigue?
     if (sysPause !== sp) return;
     if (!A.paused) { plog('reanudación confirmada: la interrupción había terminado'); sysPause = null; keepAliveSync(); }
+    else if (!ES_IOS && sp.quick && sp.tries < 6) scheduleResume(1000);
     else { sp.callActive = true; plog('la interrupción sigue (¿llamada en curso?): se espera a que termine'); }
   }, T_SONDEO);
 }
@@ -1029,9 +1138,15 @@ function systemPaused() {
   const alEmpezar = now() - lastStartAt < 6000;
   sysPause = { at: now(), tries: 0, evidencia: interruptionEvidence() };
   keepAliveSync();                                                // el audio inaudible no se mantiene durante la interrupción
+  if (!ES_IOS && alEmpezar && !sysPause.evidencia) {              // Android pausa a veces justo al empezar un episodio: reintento inmediato
+    sysPause.quick = true;
+    plog('pausa inesperada nada más empezar el episodio: se reintenta enseguida');
+    scheduleResume(250);
+    return;
+  }
   setTimeout(() => {                                              // las señales pueden llegar uno o dos segundos después de la pausa
     const sp = sysPause;
-    if (!sp) return;
+    if (!sp || sp.quick) return;
     if (!sp.evidencia) sp.evidencia = interruptionEvidence();
     if (sp.evidencia) { plog(`pausa del sistema por una interrupción (llamada, Siri…): primer intento de reanudar en ${Math.round(T_PRIMER_INTENTO / 1000)} s`); scheduleResume(Math.max(0, T_PRIMER_INTENTO - 1800)); }
     else if (alEmpezar) { plog('pausa inesperada nada más empezar el episodio: se reintenta'); scheduleResume(300); }
@@ -1280,8 +1395,8 @@ function viewSettings() {
   ${ES_IOS
     ? `<section class="sect"><h2>AirPods y Siri</h2><p>AirPods: doble pulsación, +30 s (si repites en 5 segundos: 1, 2 y 5 min); triple, lo mismo hacia atrás. Una pulsación, pausa o play.</p>
     <p class="status">Siri: «adelanta 4 minutos», «retrocede 2 minutos», «pausa», «reanuda» y «siguiente pista» / «pista anterior» (con una lista sonando, cambian de episodio).</p></section>`
-    : `<section class="sect"><h2>Botones de la pantalla de bloqueo</h2><p>⏪ y ⏩: 30 segundos. ⏮ y ⏭: episodio anterior y siguiente (con una lista sonando). Son los mismos que tiene el reproductor de la app.</p></section>`}
-  <section class="sect"><h2>Pantalla bloqueada</h2><p>Mantiene el audio activo entre episodios con un sonido inaudible, para que el móvil no suspenda la app al pasar de un episodio al siguiente con la pantalla bloqueada. Gasta algo más de batería.</p>
+    : `<section class="sect"><h2>Botones de la pantalla de bloqueo y AirPods</h2><p>⏪ y ⏩: 30 segundos. ⏮ y ⏭ (y la doble y triple pulsación de los AirPods): saltos de tiempo, 30 s y, si repites en 5 segundos, 1, 2 y 5 min. Con el botón «⏮⏭» del reproductor puedes cambiarlos a episodio anterior y siguiente.</p></section>`}
+  <section class="sect"><h2>Pantalla bloqueada</h2><p>Mantiene el audio activo entre episodios con un sonido inaudible, para que el móvil no suspenda la app al pasar de un episodio al siguiente con la pantalla bloqueada. Gasta algo más de batería.${ES_IOS ? '' : ' En Android no hace falta: el relevo entre episodios ya usa dos reproductores.'}</p>
     <label class="switch"><span>Mantener activa la reproducción</span><input type="checkbox" data-act="toggle-keepalive" ${cfg.keepAlive ? 'checked' : ''}></label></section>
   <section class="sect"><h2>Registro de reproducción</h2><p>Apunta lo que ocurre al cambiar de episodio. Si algo falla, haz la prueba, pulsa «Copiar» y pégame el texto para ver qué pasó.</p>
     <div class="row-btns"><button class="btn" data-act="log-view">Ver</button><button class="btn" data-act="log-copy">Copiar</button><button class="btn" data-act="log-clear">Borrar</button></div></section>
@@ -1341,6 +1456,7 @@ function renderPlayer() {
   if (p.dataset.ep !== cur.id) renderPlayerHtml(p);
   onTime();
 }
+const npLabel = () => '⏮⏭ ' + (cfg.npMode === 'episode' ? 'episodio' : 'tiempo');
 function renderPlayerHtml(p) {
   const s = state.shows[cur.showId];
   p.dataset.ep = cur.id;
@@ -1358,6 +1474,7 @@ function renderPlayerHtml(p) {
     </div>
     <div class="transport2">
       <button class="icon-btn rate" id="p-rate" data-act="rate" aria-label="Velocidad">${cfg.rate}×</button>
+      ${ES_IOS ? '' : `<button class="pill" id="p-np" data-act="np-mode" aria-label="Qué hacen los botones anterior y siguiente de la pantalla de bloqueo y de los AirPods">${npLabel()}</button>`}
       ${dlBtn(cur.id)}
     </div>`;
 }
@@ -1521,6 +1638,12 @@ const actions = {
   'ep-prev': () => prevEp(),
   'ep-next': () => nextEp(),
   'open-dl': () => go({ tab: 'settings', dl: true }),
+  'np-mode': () => {
+    cfg.npMode = cfg.npMode === 'episode' ? 'time' : 'episode'; saveCfg();
+    const b = $('#p-np'); if (b) b.textContent = npLabel();
+    plog('⏮⏭ de la pantalla de bloqueo y de los AirPods: ' + (cfg.npMode === 'episode' ? 'episodio anterior / siguiente' : 'saltos de tiempo'));
+    toast(cfg.npMode === 'episode' ? '⏮⏭ cambian de episodio' : '⏮⏭ saltan tiempo (30 s, 1, 2 y 5 min)');
+  },
   'log-view': () => {
     const t = plogBuf.length ? plogText(120) : 'Todavía no hay nada registrado. Reproduce una lista y vuelve aquí.';
     sheet(`<h2>Registro de reproducción</h2><pre class="plog">${esc(t)}</pre><div class="row-btns"><button class="btn" data-act="log-copy">Copiar</button><button class="btn" data-act="close-sheet">Cerrar</button></div>`);
@@ -1932,6 +2055,7 @@ window.addEventListener('pagehide', () => plog('pagehide'));
 document.addEventListener('freeze', () => plog('LA APP HA SIDO CONGELADA por el sistema'));
 document.addEventListener('resume', () => plog('la app se ha reanudado tras estar congelada'));
 document.addEventListener('pointerdown', kickIfNeeded, true);
+if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) navigator.mediaDevices.addEventListener('devicechange', () => plog('cambio en los dispositivos de audio (¿Bluetooth, auriculares?)'));
 window.addEventListener('online', () => { if (cfgOK()) sync(); });
 
 /* =====================================================================
