@@ -3,7 +3,8 @@
 /* =====================================================================
    Utilidades
    ===================================================================== */
-const APP_VERSION = 'v23';
+const APP_VERSION = 'v24';
+const ES_IOS = /iPhone|iPad|iPod/i.test(navigator.userAgent);   // en iPhone mandan Siri y los AirPods; en Android, los botones de la pantalla de bloqueo
 const RAPIDO = !!window.__PC_RAPIDO;                 // solo para las pruebas automáticas: acorta las esperas
 const T_PRIMER_INTENTO = RAPIDO ? 600 : 12000;       // tras una interrupción, primer intento de reanudar
 const T_SONDEO = RAPIDO ? 900 : 8000;                // si en este tiempo vuelve a pausarse, la interrupción sigue
@@ -978,16 +979,17 @@ function growJump(dir) {
   // Siri convierte «siguiente pista» / «pista anterior» en un salto estándar de 15 s. Con una lista sonando, ese salto cambia de episodio
   // (si hay otro episodio en esa dirección); con cualquier otro tiempo («adelanta 4 minutos») salta ese tiempo.
   h('seekforward', (d) => {
-    if (d.seekOffset === 15 && qi + 1 < queue.length) { plog('«siguiente pista» de Siri (salto estándar de 15 s) → siguiente episodio'); nextEp(); return; }
+    if (ES_IOS && d.seekOffset === 15 && qi + 1 < queue.length) { plog('«siguiente pista» de Siri (salto estándar de 15 s) → siguiente episodio'); nextEp(); return; }
     jump(tiempo(d));
   });
   h('seekbackward', (d) => {
-    if (d.seekOffset === 15 && qi > 0) { plog('«pista anterior» de Siri (salto estándar de 15 s) → episodio anterior'); prevEp(); return; }
+    if (ES_IOS && d.seekOffset === 15 && qi > 0) { plog('«pista anterior» de Siri (salto estándar de 15 s) → episodio anterior'); prevEp(); return; }
     jump(-tiempo(d));
   });
-  // Doble y triple pulsación de los AirPods: saltos de tiempo que crecen si se repiten
-  h('nexttrack', () => growJump(1));
-  h('previoustrack', () => growJump(-1));
+  // iPhone: doble y triple pulsación de los AirPods = saltos de tiempo que crecen si se repiten.
+  // Android: ⏮ ⏭ de la pantalla de bloqueo = episodio anterior / siguiente.
+  h('nexttrack', () => { if (ES_IOS) growJump(1); else nextEp(); });
+  h('previoustrack', () => { if (ES_IOS) growJump(-1); else prevEp(); });
   h('seekto', (d) => { if (d.seekTime != null) A.currentTime = d.seekTime; });
 })();
 
@@ -1275,8 +1277,10 @@ function viewSettings() {
   <section class="sect"><h2>Descargas</h2><div class="dl-line"><p id="storage-info"></p><button class="btn" data-act="open-dl">Ver episodios</button></div>
     <label class="switch"><span>Borrar la descarga al terminar un episodio</span><input type="checkbox" data-act="toggle-autodel" ${cfg.autoDelete ? 'checked' : ''}></label>
     <button class="btn danger wide" data-act="clear-dl" style="margin-top:8px">Borrar todas las descargas</button></section>
-  <section class="sect"><h2>AirPods y Siri</h2><p>AirPods: doble pulsación, +30 s (si repites en 5 segundos: 1, 2 y 5 min); triple, lo mismo hacia atrás. Una pulsación, pausa o play.</p>
-    <p class="status">Siri: «adelanta 4 minutos», «retrocede 2 minutos», «pausa», «reanuda» y «siguiente pista» / «pista anterior» (con una lista sonando, cambian de episodio).</p></section>
+  ${ES_IOS
+    ? `<section class="sect"><h2>AirPods y Siri</h2><p>AirPods: doble pulsación, +30 s (si repites en 5 segundos: 1, 2 y 5 min); triple, lo mismo hacia atrás. Una pulsación, pausa o play.</p>
+    <p class="status">Siri: «adelanta 4 minutos», «retrocede 2 minutos», «pausa», «reanuda» y «siguiente pista» / «pista anterior» (con una lista sonando, cambian de episodio).</p></section>`
+    : `<section class="sect"><h2>Botones de la pantalla de bloqueo</h2><p>⏪ y ⏩: 30 segundos. ⏮ y ⏭: episodio anterior y siguiente (con una lista sonando). Son los mismos que tiene el reproductor de la app.</p></section>`}
   <section class="sect"><h2>Pantalla bloqueada</h2><p>Mantiene el audio activo entre episodios con un sonido inaudible, para que el móvil no suspenda la app al pasar de un episodio al siguiente con la pantalla bloqueada. Gasta algo más de batería.</p>
     <label class="switch"><span>Mantener activa la reproducción</span><input type="checkbox" data-act="toggle-keepalive" ${cfg.keepAlive ? 'checked' : ''}></label></section>
   <section class="sect"><h2>Registro de reproducción</h2><p>Apunta lo que ocurre al cambiar de episodio. Si algo falla, haz la prueba, pulsa «Copiar» y pégame el texto para ver qué pasó.</p>
