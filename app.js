@@ -3,7 +3,7 @@
 /* =====================================================================
    Utilidades
    ===================================================================== */
-const APP_VERSION = 'v22';
+const APP_VERSION = 'v23';
 const RAPIDO = !!window.__PC_RAPIDO;                 // solo para las pruebas automáticas: acorta las esperas
 const T_PRIMER_INTENTO = RAPIDO ? 600 : 12000;       // tras una interrupción, primer intento de reanudar
 const T_SONDEO = RAPIDO ? 900 : 8000;                // si en este tiempo vuelve a pausarse, la interrupción sigue
@@ -1591,11 +1591,17 @@ const actions = {
       return;
     }
     const one = n === 1;
-    sheet(`<h2>Quitar ${n} episodio${one ? '' : 's'}</h2><p>${one ? 'Se quitará de todas las listas donde esté y se borrará su descarga. Sigue disponible en su programa.' : 'Se quitarán de todas las listas donde estén y se borrarán sus descargas. Siguen disponibles en su programa.'}</p>
-      <div class="row-stack"><button class="btn danger wide" data-act="sel-remove-ok">Quitar de todas las listas</button>
-      <button class="btn wide" data-act="close-sheet">Cancelar</button></div>`);
+    const otras = ids.filter((x) => visibleLists().some((l) => l.id !== route.list && l.items.includes(x))).length;
+    const conDl = ids.filter((x) => downloaded.has(x)).length;
+    const info = [otras ? `${otras} ${otras === 1 ? 'está' : 'están'} también en otras listas` : '', conDl ? `${conDl} ${conDl === 1 ? 'tiene' : 'tienen'} descarga` : ''].filter(Boolean).join('; ');
+    sheet(`<h2>Quitar ${n} episodio${one ? '' : 's'}</h2>${info ? `<p>${info}.</p>` : ''}
+      <div class="row-stack"><button class="btn wide" data-act="sel-remove-here">Quitar de la lista actual</button>
+      <button class="btn danger wide" data-act="sel-remove-ok">Quitar de todas las listas y borrar descargas</button>
+      <button class="btn wide" data-act="close-sheet">Cancelar</button></div>
+      <p class="small muted">«Lista actual»: se quedan en las demás listas y no se borra ninguna descarga. «Todas las listas»: se quitan de todas y se borra su descarga. En ambos casos siguen disponibles en su programa.</p>`);
   },
   'sel-remove-ok': () => removeSelected(),
+  'sel-remove-here': () => removeFromCurrentList(),
   'dl-del-all': () => deleteDownloads(Array.from(sel)),
   'list-menu': (el, id) => sheet(`<h2>${esc(state.playlists[id]?.name || '')}</h2><ul class="sheet-list"><li><button data-act="list-rename" data-id="${id}">Cambiar nombre</button></li><li><button data-act="list-delete" data-id="${id}">Eliminar lista</button></li></ul><button class="btn wide" data-act="close-sheet">Cerrar</button>`),
   'list-rename': async (el, id) => {
@@ -1688,6 +1694,18 @@ async function removeSelected() {
   closeSheet();
   await purgeEpisodes(ids);
   toast(`Quitado${ids.length === 1 ? '' : 's'} ${ids.length} episodio${ids.length === 1 ? '' : 's'} de todas las listas`);
+  exitSel(); render();
+}
+// Quita los episodios seleccionados solo de la lista que se está viendo: siguen en las demás listas y se conservan las descargas
+function removeFromCurrentList() {
+  const l = state.playlists[route.list];
+  const ids = new Set(sel);
+  closeSheet();
+  if (!l) return;
+  l.items = l.items.filter((x) => !ids.has(x));
+  l.mod = now(); touch();
+  plog(`quitados ${ids.size} episodio(s) solo de la lista «${short(l.name, 30)}»`);
+  toast(`Quitado${ids.size === 1 ? '' : 's'} ${ids.size} episodio${ids.size === 1 ? '' : 's'} de «${short(l.name, 24)}»`);
   exitSel(); render();
 }
 async function deleteDownloads(ids) {

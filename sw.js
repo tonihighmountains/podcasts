@@ -1,5 +1,5 @@
 // Cambia VERSION cada vez que subas una versión nueva de la app
-const VERSION = 'v22';
+const VERSION = 'v23';
 const SHELL_CACHE = 'shell-' + VERSION;
 const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'manifest.webmanifest', 'icon-180.png', 'icon-192.png', 'icon-512.png'];
 

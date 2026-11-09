@@ -119,11 +119,11 @@ h1, h2, p { margin: 0; }
 .ep-side { display: flex; flex: none; }
 
 /* Listas */
-.cards { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 3px; }
-.card { width: 100%; display: flex; flex-direction: column; gap: 0; padding: 8px 14px; border-radius: 12px; background: var(--surface); }
+.cards { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.card { width: 100%; display: flex; flex-direction: column; gap: 0; padding: 5px 12px; border-radius: 10px; background: var(--surface); }
 .card:active { background: var(--surface2); }
-.card-title { font-size: 16px; font-weight: 650; line-height: 1.25; }
-.card-sub { color: var(--muted); font-size: 12.5px; line-height: 1.25; }
+.card-title { font-size: 15px; font-weight: 650; line-height: 1.2; }
+.card-sub { color: var(--muted); font-size: 12px; line-height: 1.2; }
 .list-actions { display: flex; gap: 10px; padding: 4px 0 14px; }
 .list-actions .btn { flex: 1; }
 
@@ -250,7 +250,7 @@ h1, h2, p { margin: 0; }
 .cards .swipe { border-radius: 12px; }
 .cards .row { gap: 2px; }
 .cards .row .card { flex: 1; width: auto; min-width: 0; }
-.cards .grip { height: 48px; width: 34px; }
+.cards .grip { height: 38px; width: 32px; }
 .cards { position: relative; }
 
 /* Ficha del episodio (descripción) */
@@ -305,12 +305,12 @@ h1, h2, p { margin: 0; }
 
 /* Selector de listas: casillas redondas, varias a la vez */
 .picks { list-style: none; margin: 0 0 4px; padding: 0; }
-.pick { width: 100%; min-height: 52px; display: flex; align-items: center; gap: 12px; text-align: left; font-weight: 600; border-top: 1px solid var(--line); }
+.pick { width: 100%; min-height: 40px; display: flex; align-items: center; gap: 10px; text-align: left; font-size: 15px; font-weight: 600; border-top: 1px solid var(--line); }
 .pick .ic { color: var(--muted); flex: none; }
 .pick.on .ic { color: var(--accent); }
 .pick:disabled { opacity: 0.55; cursor: default; }
 .pick-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.pick-tag { color: var(--muted); font-weight: 400; font-size: 13px; flex: none; }
+.pick-tag { color: var(--muted); font-weight: 400; font-size: 12.5px; flex: none; }
 .pick.new { border-bottom: 1px solid var(--line); margin-bottom: 4px; }
 
 /* Marca de descargado en las listas */
