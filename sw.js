@@ -1,5 +1,5 @@
 // Cambia VERSION cada vez que subas una versión nueva de la app
-const VERSION = 'v25';
+const VERSION = 'v27';
 const SHELL_CACHE = 'shell-' + VERSION;
 const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'manifest.webmanifest', 'icon-180.png', 'icon-192.png', 'icon-512.png'];
 
@@ -27,7 +27,7 @@ self.addEventListener('fetch', (e) => {
   if (url.origin === location.origin) {
     e.respondWith(networkFirst(e, req));
   }
-  // El resto (puente, audios, RSS, imágenes) va directo a la red: las portadas las guarda la propia app
+  // El resto (puente, audios, imágenes, RSS) va directo a la red
 });
 
 // Aplicación: siempre intenta la versión más reciente (revalidando con GitHub); si tarda más de 2,5 s o no hay red, usa la copia guardada

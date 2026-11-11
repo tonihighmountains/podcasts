@@ -3,7 +3,7 @@
 /* =====================================================================
    Utilidades
    ===================================================================== */
-const APP_VERSION = 'v25';
+const APP_VERSION = 'v27';
 const ES_IOS = /iPhone|iPad|iPod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 const DUAL = !ES_IOS;      // Android y demás: dos elementos de audio, el segundo prepara el siguiente episodio (relevo sin silencio)   // en iPhone mandan Siri y los AirPods; en Android, los botones de la pantalla de bloqueo
 const RAPIDO = !!window.__PC_RAPIDO;                 // solo para las pruebas automáticas: acorta las esperas
@@ -97,11 +97,11 @@ const epMap = new Map();
 let plogBuf = jget(LS.log, []), plogT = 0;
 function plog(m) {
   plogBuf.push([Date.now(), (document.visibilityState || '?')[0], String(m)]);
-  if (plogBuf.length > 400) plogBuf.splice(0, plogBuf.length - 400);
+  if (plogBuf.length > 700) plogBuf.splice(0, plogBuf.length - 700);
   clearTimeout(plogT);
   plogT = setTimeout(() => jset(LS.log, plogBuf), 1500);
 }
-function plogText(n = 220) {
+function plogText(n = 700) {
   const hd = `Podcasts ${typeof APP_VERSION === 'string' ? APP_VERSION : ''} - ${navigator.userAgent}\n(v = pantalla visible, h = pantalla bloqueada o app en segundo plano)\n`;
   return hd + plogBuf.slice(-n).map(([t, v, m]) => `${new Date(t).toLocaleTimeString('es-ES', { hour12: false })} ${v} ${m}`).join('\n');
 }
@@ -657,6 +657,16 @@ async function playWithRetry() {
   return false;
 }
 // Al volver a la app (o al primer toque), si un episodio no llegó a arrancar, se reintenta
+// A veces iOS da el audio por «sonando» sin que se oiga (por ejemplo, al volver a ponerse los AirPods): pausar y reanudar lo arregla
+let lastProgressAt = 0, lastCT = -1, lastKickAt = 0, lastPlayCallAt = 0, stallKicks = 0;
+function restartPlayback(origen) {
+  if (!cur || now() - lastKickAt < 3000) return;
+  lastKickAt = now();
+  plog(`el audio figura sonando pero no se oye o no avanza (${origen}): se reinicia la reproducción`);
+  selfPause = now();
+  try { A.pause(); } catch {}
+  setTimeout(() => { if (wantPlay && cur) { lastPlayCallAt = now(); A.play().catch((e) => plog('reinicio: play() falló (' + (e && e.name) + ')')); } }, 300);
+}
 function kickIfNeeded() {
   if (!needsKick || !wantPlay || !cur || !A.paused) return;
   plog('reintento de reproducción al volver a la app');
@@ -907,7 +917,11 @@ function checkHandoff(medir) {
   if (rem < 600) scheduleHandoff();
   return false;
 }
-setInterval(() => { if (cur && ready && !A.paused && !handingOff) checkHandoff(false); }, 400);   // por si los avisos de progreso se espacian o se pierden
+setInterval(() => {
+  if (!cur || !ready || A.paused || handingOff) return;
+  checkHandoff(false);
+  if (wantPlay && A.readyState >= 3 && stallKicks < 2 && now() - lastProgressAt > 6000) { stallKicks++; restartPlayback('vigilancia'); }
+}, 400);   // por si los avisos de progreso se espacian o se pierden
 // Al desbloquear el móvil: si el episodio terminó mientras estaba bloqueado y no se encadenó, se encadena ya
 function catchUpAfterHidden() {
   if (!cur || !wantPlay || handingOff || qi + 1 >= queue.length) return;
@@ -916,6 +930,7 @@ function catchUpAfterHidden() {
 }
 function onTime() {
   if (!cur || !ready) return;
+  if (A.currentTime !== lastCT) { lastCT = A.currentTime; lastProgressAt = now(); stallKicks = 0; }
   const d = A.duration || cur.dur || 0, t = A.currentTime;
   const pct = d ? Math.min(100, (t / d) * 100) : 0;
   const mb = $('#mini-bar'); if (mb) mb.style.width = pct + '%';
@@ -1000,7 +1015,7 @@ function onAudioError() {
   toast(navigator.onLine ? 'No se puede reproducir este episodio' : 'Sin conexión. Descarga el episodio para escucharlo sin red.');
 }
 function onPlayEvt() {
-  needsKick = false; lastPlayAt = lastStartAt = now();
+  needsKick = false; lastPlayAt = lastStartAt = lastProgressAt = now();
   const sondeando = sysPause && sysPause.resumedAt && now() - sysPause.resumedAt < T_SONDEO + 1000;
   if (!sondeando) { sysPause = null; clearTimeout(resumeT); }     // si es un intento nuestro, se mantiene hasta confirmar que aguanta
   plog('evento «play»'); setWant(true); setPlaying(true);
@@ -1057,8 +1072,8 @@ function jump(sg) {
   plog(`salto ${sg > 0 ? '+' : '-'}${fmtSalto(sg)}`);
   if (document.visibilityState === 'visible') toast((sg > 0 ? 'Adelantado ' : 'Retrocedido ') + fmtSalto(sg));
 }
-// Modo «saltar tiempo»: si se repite en pocos segundos, el salto crece (30 s, 1, 2 y 5 min)
-const SALTOS = [30, 60, 120, 300];
+// Saltos repetidos en pocos segundos: 30 s, 30 s, 1 min y 3 min. Como se suman, el total va siendo 30 s, 1, 2 y 5 min
+const SALTOS = [30, 30, 60, 180];
 let growIdx = 0, growAt = 0, growDir = 1;
 function growJump(dir) {
   const n = now();
@@ -1081,7 +1096,11 @@ function growJump(dir) {
   // «Adelanta 40 segundos» / «retrocede 5 minutos»: se usa el tiempo que mande el sistema. 10 s es el valor por defecto de
   // Android y 15 s el de iOS; con otros valores se usa el que llegue.
   const tiempo = (d) => (typeof d.seekOffset === 'number' && d.seekOffset > 0 && d.seekOffset !== 10 ? d.seekOffset : SKIP);
-  h('play', () => { sysPause = null; clearTimeout(resumeT); setWant(true); A.play().catch(() => {}); });
+  h('play', () => {
+    sysPause = null; clearTimeout(resumeT); setWant(true);
+    if (cur && !A.paused && now() - lastPlayCallAt > 1500 && now() - lastPlayAt > 1500) { restartPlayback('orden de reanudar con el audio ya en marcha'); return; }
+    lastPlayCallAt = now(); A.play().catch(() => {});
+  });
   h('pause', () => { setWant(false); pauseByUs(); });
   h('stop', () => { setWant(false); pauseByUs(); });
   // Siri convierte «siguiente pista» / «pista anterior» en un salto estándar de 15 s. Con una lista sonando, ese salto cambia de episodio
@@ -1136,9 +1155,17 @@ function tryResume() {
 function systemPaused() {
   if (sysPause) return;
   const alEmpezar = now() - lastStartAt < 6000;
-  sysPause = { at: now(), tries: 0, evidencia: interruptionEvidence() };
+  const ev = interruptionEvidence();
+  if (ES_IOS) {
+    // En iPhone play() funciona incluso con una llamada en curso (la canción sonaría durante la llamada), así que nunca
+    // se reanuda por tiempo: solo con un aviso explícito de fin o con la orden de reanudar del sistema o del usuario.
+    if (ev) { sysPause = { at: now(), tries: 0, evidencia: true, callActive: true }; keepAliveSync(); plog('pausa del sistema por una interrupción: se espera el aviso de fin o la orden de reanudar'); }
+    else plog('pausa del sistema (llamada, Siri, auriculares…): se reanudará con la orden del sistema o la tuya');
+    return;
+  }
+  sysPause = { at: now(), tries: 0, evidencia: ev };
   keepAliveSync();                                                // el audio inaudible no se mantiene durante la interrupción
-  if (!ES_IOS && alEmpezar && !sysPause.evidencia) {              // Android pausa a veces justo al empezar un episodio: reintento inmediato
+  if (alEmpezar && !ev) {                                         // Android pausa a veces justo al empezar un episodio: reintento inmediato
     sysPause.quick = true;
     plog('pausa inesperada nada más empezar el episodio: se reintenta enseguida');
     scheduleResume(250);
@@ -1148,18 +1175,17 @@ function systemPaused() {
     const sp = sysPause;
     if (!sp || sp.quick) return;
     if (!sp.evidencia) sp.evidencia = interruptionEvidence();
-    if (sp.evidencia) { plog(`pausa del sistema por una interrupción (llamada, Siri…): primer intento de reanudar en ${Math.round(T_PRIMER_INTENTO / 1000)} s`); scheduleResume(Math.max(0, T_PRIMER_INTENTO - 1800)); }
-    else if (alEmpezar) { plog('pausa inesperada nada más empezar el episodio: se reintenta'); scheduleResume(300); }
+    if (sp.evidencia) { plog(`pausa del sistema por una interrupción: primer intento de reanudar en ${Math.round(T_PRIMER_INTENTO / 1000)} s`); scheduleResume(Math.max(0, T_PRIMER_INTENTO - 1800)); }
     else { plog('pausa del sistema sin señal de interrupción (¿auricular quitado?): no se reanuda sola'); sysPause = null; keepAliveSync(); }
   }, 1800);
 }
 function pauseForInterruption() {
   if (!wantPlay || !cur || A.paused || sysPause) return;
   plog('interrupción con el audio sonando: se pausa hasta que termine (Siri, llamada…)');
-  sysPause = { at: now(), tries: 0, evidencia: true };
+  sysPause = { at: now(), tries: 0, evidencia: true, callActive: ES_IOS };
   keepAliveSync();
   try { A.pause(); } catch {}
-  scheduleResume(T_PRIMER_INTENTO);                               // respaldo por si nunca llega el aviso de fin
+  if (!ES_IOS) scheduleResume(T_PRIMER_INTENTO);                  // respaldo por si nunca llega el aviso de fin (en iPhone no: sonaría durante la llamada)
 }
 function interruptionEnded(origen) {
   plog('fin de la interrupción del audio (' + origen + ')');
@@ -1181,10 +1207,8 @@ if (navigator.audioSession) {
     plog(`audioSession: aviso, estado «${st}», audio ${sonando ? 'sonando' : 'parado'}`);
     if (st === 'interrupted') { wasInterrupted = true; noteInterruption('audioSession'); pauseForInterruption(); return; }
     if (st && wasInterrupted) { wasInterrupted = false; interruptionEnded('audioSession'); return; }
-    if (st) return;
-    // Aviso sin estado (lo habitual en Safari de iPhone)
-    if (sonando && now() - lastPlayAt > 2000) noteInterruption('aviso de audioSession con el audio sonando');
-    else if (!sonando && sysPause && now() - sysPause.at > 3000) interruptionEnded('aviso de audioSession');
+    // Sin estado (lo habitual en Safari de iPhone) el aviso solo acompaña a nuestras propias pausas y reanudaciones:
+    // llega igual con una llamada que al pausar a mano, así que no se usa como señal.
   });
 } else plog('audioSession NO disponible en este navegador');
 
@@ -1393,9 +1417,9 @@ function viewSettings() {
     <label class="switch"><span>Borrar la descarga al terminar un episodio</span><input type="checkbox" data-act="toggle-autodel" ${cfg.autoDelete ? 'checked' : ''}></label>
     <button class="btn danger wide" data-act="clear-dl" style="margin-top:8px">Borrar todas las descargas</button></section>
   ${ES_IOS
-    ? `<section class="sect"><h2>AirPods y Siri</h2><p>AirPods: doble pulsación, +30 s (si repites en 5 segundos: 1, 2 y 5 min); triple, lo mismo hacia atrás. Una pulsación, pausa o play.</p>
+    ? `<section class="sect"><h2>AirPods y Siri</h2><p>AirPods: doble pulsación, +30 s; si repites en 5 segundos se van sumando hasta 1, 2 y 5 min en total; triple, lo mismo hacia atrás. Una pulsación, pausa o play.</p>
     <p class="status">Siri: «adelanta 4 minutos», «retrocede 2 minutos», «pausa», «reanuda» y «siguiente pista» / «pista anterior» (con una lista sonando, cambian de episodio).</p></section>`
-    : `<section class="sect"><h2>Botones de la pantalla de bloqueo y AirPods</h2><p>⏪ y ⏩: 30 segundos. ⏮ y ⏭ (y la doble y triple pulsación de los AirPods): saltos de tiempo, 30 s y, si repites en 5 segundos, 1, 2 y 5 min. Con el botón «⏮⏭» del reproductor puedes cambiarlos a episodio anterior y siguiente.</p></section>`}
+    : `<section class="sect"><h2>Botones de la pantalla de bloqueo y AirPods</h2><p>⏪ y ⏩: 30 segundos. ⏮ y ⏭ (y la doble y triple pulsación de los AirPods): saltos de tiempo de 30 s; si repites en 5 segundos se van sumando hasta 1, 2 y 5 min en total. Con el botón «⏮⏭» del reproductor puedes cambiarlos a episodio anterior y siguiente.</p></section>`}
   <section class="sect"><h2>Pantalla bloqueada</h2><p>Mantiene el audio activo entre episodios con un sonido inaudible, para que el móvil no suspenda la app al pasar de un episodio al siguiente con la pantalla bloqueada. Gasta algo más de batería.${ES_IOS ? '' : ' En Android no hace falta: el relevo entre episodios ya usa dos reproductores.'}</p>
     <label class="switch"><span>Mantener activa la reproducción</span><input type="checkbox" data-act="toggle-keepalive" ${cfg.keepAlive ? 'checked' : ''}></label></section>
   <section class="sect"><h2>Registro de reproducción</h2><p>Apunta lo que ocurre al cambiar de episodio. Si algo falla, haz la prueba, pulsa «Copiar» y pégame el texto para ver qué pasó.</p>
@@ -1642,7 +1666,7 @@ const actions = {
     cfg.npMode = cfg.npMode === 'episode' ? 'time' : 'episode'; saveCfg();
     const b = $('#p-np'); if (b) b.textContent = npLabel();
     plog('⏮⏭ de la pantalla de bloqueo y de los AirPods: ' + (cfg.npMode === 'episode' ? 'episodio anterior / siguiente' : 'saltos de tiempo'));
-    toast(cfg.npMode === 'episode' ? '⏮⏭ cambian de episodio' : '⏮⏭ saltan tiempo (30 s, 1, 2 y 5 min)');
+    toast(cfg.npMode === 'episode' ? '⏮⏭ cambian de episodio' : '⏮⏭ saltan tiempo (30 s; repetidos, hasta 1, 2 y 5 min)');
   },
   'log-view': () => {
     const t = plogBuf.length ? plogText(120) : 'Todavía no hay nada registrado. Reproduce una lista y vuelve aquí.';
